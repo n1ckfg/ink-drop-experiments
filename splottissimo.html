@@ -70,8 +70,8 @@ const THEME = {
 const RING_LIFE = 18.0;   // sketch.html: impact to fully faded
 const RING_STAGGER = 2.25;
 const RING_CLICK_GAP = 0.7;  // min seconds between click-spawned rings
-const RING_LIFT  = 2.6;   // how fast the solvent lifts pigment, per second
-const RING_SMEAR = 0.048; // how far the bands are dragged out of true
+const RING_LIFT  = 1.6;   // how fast the solvent lifts pigment, per second
+const RING_SMEAR = 0.075; // how far the bands are dragged out of true
 const RING_DRAG  = 0.012; // how far lifted pigment is smeared along the wipe
 const RING_CAP = 8;       // live rings; the spare slots let retired ones fade out
 const RING_RETIRE = 1.5;  // seconds a ring takes to fade when its slot is claimed
@@ -227,12 +227,18 @@ float ringLift(vec2 p, vec2 origin, float age, float seed, float tooth){
   float n5 = vnoise(q * 47.0 + seed * 5.1);
 
   float a = atan(q.y, q.x);
-  float wob = 1.0 + 0.06 * sin(a * 5.0 + seed * 6.283)
-                  + 0.04 * sin(a * 9.0 - seed * 3.141);
+  float wob = 1.0 + 0.075 * sin(a * 5.0 + seed * 6.283)
+                  + 0.050 * sin(a * 9.0 - seed * 3.141)
+                  + 0.030 * sin(a * 17.0 + seed * 1.7);
 
   // the smear: drag the sample far enough that the bands tear open
   vec2 warp = (vec2(n1, n2) - 0.5) * RSMEAR + (vec2(n3, n4) - 0.5) * (RSMEAR * 0.40);
   float d = length(q + warp) * wob;
+
+  // The lift is permanent, so anything that sits still keeps eating the same
+  // pixels until they are bare white.  Only the advancing front stays wet at
+  // full strength; every stationary term dries off instead.
+  float dry = exp(-age * 0.5);
 
   float lift = 0.0;
 
@@ -240,24 +246,27 @@ float ringLift(vec2 p, vec2 origin, float age, float seed, float tooth){
   float w = 0.020 + 0.016 * exp(-age * 0.4);
   lift += 0.95 * (1.0 - smoothstep(-w, w * 0.6, sdRing(d, R, w)));
 
-  // bands the advancing front left behind
+  // bands the advancing front left behind, drying as they go
   for (int i = 1; i <= 4; i++){
     float fi = float(i);
     float sr = R * (1.0 - 0.16 * fi);
     float sw = 0.010 + 0.004 * sin(sr * 40.0 + fi + seed * 6.0);
-    lift += (0.42 / fi) * (1.0 - smoothstep(-sw, sw * 0.7, sdRing(d, sr, sw)));
+    lift += (0.42 / fi) * (0.30 + 0.70 * dry)
+          * (1.0 - smoothstep(-sw, sw * 0.7, sdRing(d, sr, sw)));
   }
 
-  // the soaked interior comes up too, but only partly
-  lift += 0.26 * (1.0 - smoothstep(R * 0.15, R, d));
+  // The bands do the erasing; the interior only gets a breath of it.  At any
+  // real strength this term wipes the whole disc bare in a couple of seconds,
+  // which reads as a hole punched in the picture rather than a wipe.
+  lift += 0.07 * dry * (1.0 - smoothstep(R * 0.15, R, d));
 
-  // and the pool at the point of impact comes up clean
+  // and the pool at the point of impact comes up clean, briefly
   float pool = 0.014 + 0.034 * (1.0 - exp(-age * 0.35));
-  lift += 0.90 * (1.0 - smoothstep(pool * 0.45, pool, d));
+  lift += 0.55 * exp(-age * 0.7) * (1.0 - smoothstep(pool * 0.45, pool, d));
 
-  // messy coverage: some patches lift clean, others hardly take at all, and
-  // pigment held down in the tooth of the paper resists the rag
-  lift *= 0.30 + 1.30 * (n3 * 0.45 + n5 * 0.35 + n1 * 0.20);
+  // messy coverage: the rag tears open where it barely touched, lifts clean
+  // where it bit, and pigment held in the tooth of the paper resists it
+  lift *= smoothstep(0.10, 0.52, n3 * 0.45 + n5 * 0.35 + n1 * 0.20) * 1.40;
   lift *= 1.15 - 0.45 * tooth;
 
   float env = smoothstep(0.0, 0.3, age) * (1.0 - smoothstep(RLIFE * 0.35, RLIFE, age));
