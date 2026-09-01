@@ -1,6 +1,0 @@
-- Merge four watercolor droplet style shaders into one glorious combination using attributes of all four:
-- ref/spiffy.html 
-- ref/spiffy2.html 
-- ref/splotty.html
-- ref/sketch.html
-- Call the merged version splottissimo.html
