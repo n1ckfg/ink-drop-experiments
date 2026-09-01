@@ -26,7 +26,7 @@
 </head>
 <body>
 <canvas id="c"></canvas>
-<div id="hint">click to bloom · c to clear · space to pause</div>
+<div id="hint">click to splash · c to clear · space to pause</div>
 <div id="stats"></div>
 <script>
 "use strict";
@@ -36,21 +36,31 @@ const gl = canvas.getContext('webgl2', { alpha: false, antialias: false, preserv
 if (!gl) { document.body.innerHTML = '<p style="font:14px system-ui;padding:2rem">WebGL2 is required.</p>'; throw new Error('no webgl2'); }
 
 const MAXD = 32;          // drops per pass
-const BAKE_AGE = 3.5;     // seconds before a splash stamps into paper
+const MAXR = 12;          // concentric ring slots in the shader
+const BAKE_AGE = 3.5;     // seconds before an ordinary splash stamps into paper
 const FADE_TIME = 40.0;   // seconds for full fade to paper white
 const AUTO_SPAWN_MIN = 0.35;
 const AUTO_SPAWN_MAX = 1.1;
 const INITIAL_BURST = 12;
 
+const RING_LIFE = 18.0;   // sketch.html: impact to fully faded
+const RING_STAGGER = 2.25;
+const RING_CAP = 10;      // live rings; the spare slots let retired ones fade out
+const RING_RETIRE = 1.5;  // seconds a ring takes to fade when its slot is claimed
+const STAIN_MIN = 5.5;    // spiffy2.html: seconds between big falling stains
+const STAIN_MAX = 10.0;
+const STAIN_ALIVE = 3;
+
 // ================================================================ shaders
 
-const HEAD = '#version 300 es\nprecision highp float;\n#define MAXD ' + MAXD + '\n';
+const HEAD = '#version 300 es\nprecision highp float;\n#define MAXD ' + MAXD +
+             '\n#define MAXR ' + MAXR + '\n#define RLIFE ' + RING_LIFE.toFixed(1) + '\n';
 
 const COMMON = `
 uniform vec2 uRes;
 uniform vec4 uA[MAXD];   // xy center (uv) | z radius (y-units) | w seed
-uniform vec4 uB[MAXD];   // x strength | y wetness | z squash | w tendril amount
-uniform vec4 uC[MAXD];   // rgb ink transmission colour
+uniform vec4 uB[MAXD];   // x strength | y fragmentation | z squash | w tendril amount
+uniform vec4 uC[MAXD];   // rgb ink transmission colour | a softness (big stain)
 uniform int  uCount;
 
 float hash21(vec2 p){
@@ -104,8 +114,22 @@ vec3 paperColor(vec2 uv, float asp){
 }
 
 // Pigment density of one drop at aspect-corrected offset p (y up).
-float dropDensity(vec2 p, float R, float seed, float squash, float tendril, float tooth){
+// soft > 0.5 takes the spiffy2 path: a big, slow, tendril-free wash.
+float dropDensity(vec2 p, float R, float seed, float squash, float tendril,
+                  float frag, float soft, float tooth){
   p.y /= max(squash, 0.05);
+
+  if (soft > 0.5){
+    if (dot(p, p) > R * R * 4.0) return 0.0;
+    vec2 sq = p / max(R, 1e-5);
+    // one warp only: these cover a lot of screen, so they stay cheap
+    vec2 w = vec2(fbm3(vec3(sq * 0.92, seed)), fbm3(vec3(sq * 0.92, seed + 31.7))) - 0.5;
+    float d = length(sq + w * 0.44);
+    float blob = 1.0 - smoothstep(0.25, 1.0, d);           // soaked body
+    float ring = smoothstep(0.55, 0.95, d) * (1.0 - smoothstep(0.95, 1.42, d));
+    return (blob * 0.74 + ring * 0.46) * (0.84 + 0.30 * tooth);
+  }
+
   if (dot(p, p) > R * R * 9.0) return 0.0;
 
   vec2 sp = p / max(R, 1e-5);
@@ -128,6 +152,15 @@ float dropDensity(vec2 p, float R, float seed, float squash, float tendril, floa
   float thread = smoothstep(edge * (1.0 + tendril * 1.05), edge * 0.98, d) * spikes;
 
   float dens = body * 0.86 + halo * 0.19 + ring * 0.52 + thread * 0.30;
+
+  // fragmentation: noise carves the wash into shards that break apart at the rim
+  // while the core stays intact -- the shattered look from spiffy.html
+  if (frag > 0.002){
+    float shard = fbm3(vec3(sp * 3.4 + seed, seed * 0.7));
+    float carve = smoothstep(0.30, 0.66, shard + (1.0 - min(d, 1.0)) * 0.38);
+    dens *= mix(1.0, carve, frag);
+  }
+
   return dens * (0.82 + 0.36 * tooth);                        // granulation
 }
 
@@ -154,15 +187,6 @@ vec3 sampleStain(vec2 uv, sampler2D uAccum, vec2 uRes){
   s.b = mix(s.b, texture(uAccum, uv - px * 1.15).b, 0.30);
   return s;
 }
-
-// Wet specular sheen
-vec3 computeSheen(vec2 nd, float core, float wet, float R){
-  if (wet <= 0.002) return vec3(0.0);
-  vec2 sp = (nd - vec2(-0.30, 0.33) * R) / max(R, 1e-5);
-  vec3 sheen = vec3(1.0, 0.995, 0.975) * exp(-dot(sp, sp) * 6.5) * core * wet * 0.52;
-  sheen += vec3(0.86, 0.93, 1.0) * core * wet * 0.055;      // broad gloss
-  return sheen;
-}
 `;
 
 const VERT = HEAD + `
@@ -183,7 +207,8 @@ void main(){
   for (int i = 0; i < MAXD; i++){
     if (i >= uCount) break;
     vec2 p = vec2((uv.x - uA[i].x) * asp, uv.y - uA[i].y);
-    float dens = dropDensity(p, uA[i].z, uA[i].w, uB[i].z, uB[i].w, tooth) * uB[i].x;
+    float dens = dropDensity(p, uA[i].z, uA[i].w, uB[i].z, uB[i].w,
+                             uB[i].y, uC[i].a, tooth) * uB[i].x;
     if (dens <= 0.0) continue;
     T *= pigment(dens, uC[i].rgb);
   }
@@ -206,6 +231,61 @@ const FRAG_MAIN = HEAD + COMMON + `
 out vec4 fragColor;
 uniform sampler2D uAccum;
 uniform float uTime;
+uniform vec4 uRing[MAXR];   // xy origin (min-dimension units) | z age | w seed
+uniform vec4 uRingB[MAXR];  // x fade (1 while alive, ramped to 0 when retired)
+uniform int  uRingCount;
+
+// ---- concentric ink rings (sketch.html) --------------------------------
+// signed distance to a ring of radius r, half-thickness w (positive outside the band)
+float sdRing(float d, float r, float w){ return abs(d - r) - w; }
+
+float ringDrop(vec2 p, vec2 origin, float age, float seed){
+  if (age <= 0.0 || age >= RLIFE) return 0.0;
+
+  vec2 q = p - origin;
+  float d0 = length(q);
+
+  // spread decelerates and is bounded, so a drop can never flood the screen
+  float R = 0.30 * (1.0 - exp(-age * 0.45));
+  if (d0 > R * 1.4 + 0.03) return 0.0;   // reject before paying for atan/noise
+
+  float a = atan(q.y, q.x);
+
+  // organic radial distortion so nothing reads as a perfect circle
+  float wob = 1.0
+    + 0.045 * sin(a * 5.0  + seed * 6.283)
+    + 0.030 * sin(a * 9.0  - seed * 3.141)
+    + 0.018 * sin(a * 15.0 + 1.7);
+  wob += 0.06 * (vnoise(q * 7.0 + seed * 23.0) - 0.5);
+  float d = d0 * wob;
+
+  float ink = 0.0;
+
+  // leading edge: a true annulus, dark only in the band
+  float w = 0.006 + 0.004 * exp(-age * 0.5);
+  ink += 0.55 * (1.0 - smoothstep(-w, 0.0, sdRing(d, R, w)));
+
+  // trailing rings left behind by the advancing front
+  for (int i = 1; i <= 4; i++){
+    float fi = float(i);
+    float sr = R * (1.0 - 0.16 * fi);
+    float sw = 0.0035 + 0.0010 * sin(sr * 40.0 + fi + seed * 6.0);
+    ink += (0.26 / fi) * (1.0 - smoothstep(-sw, 0.0, sdRing(d, sr, sw)));
+  }
+
+  // faint wash of soaked paper inside the front, kept light so the colour reads through
+  ink += 0.09 * (1.0 - smoothstep(R * 0.2, R, d));
+
+  // central pool at the point of impact
+  float pr = 0.012 + 0.030 * (1.0 - exp(-age * 0.35));
+  ink += 0.62 * (1.0 - smoothstep(pr * 0.45, pr, d));
+
+  float env = smoothstep(0.0, 0.3, age) * (1.0 - smoothstep(RLIFE * 0.35, RLIFE, age));
+  return clamp(ink, 0.0, 1.0) * env;
+}
+
+// alpha compositing: stays in [0,1] no matter how many rings overlap
+float over(float acc, float add){ return acc + (1.0 - acc) * add; }
 
 void main(){
   vec2 uv = gl_FragCoord.xy / uRes;
@@ -216,21 +296,30 @@ void main(){
   vec3 col = paperColor(uv, asp) * sampleStain(uv, uAccum, uRes);
 
   // --- drops still wet on the surface ---
-  vec3 sheen = vec3(0.0);
   for (int i = 0; i < MAXD; i++){
     if (i >= uCount) break;
-    float R = uA[i].z, squash = uB[i].z;
     vec2 p = vec2((uv.x - uA[i].x) * asp, uv.y - uA[i].y);
-    float dens = dropDensity(p, R, uA[i].w, squash, uB[i].w, tooth) * uB[i].x;
+    float dens = dropDensity(p, uA[i].z, uA[i].w, uB[i].z, uB[i].w,
+                             uB[i].y, uC[i].a, tooth) * uB[i].x;
     if (dens <= 0.0) continue;
-
     col *= pigment(dens, uC[i].rgb);
-
-    float wet = uB[i].y;
-    float core = smoothstep(0.05, 0.42, dens);
-    sheen += computeSheen(vec2(p.x, p.y / max(squash, 0.05)), core, wet, R);
   }
-  col += sheen;
+
+  // --- black concentric lines, laid over the wash ---
+  vec2 pr = (uv - 0.5) * vec2(asp, 1.0);   // min-dimension units, y up
+  float inkA = 0.0;
+  for (int i = 0; i < MAXR; i++){
+    if (i >= uRingCount) break;
+    float fade = uRingB[i].x;
+    if (fade <= 0.0) continue;
+    inkA = over(inkA, ringDrop(pr, uRing[i].xy, uRing[i].z, uRing[i].w) * fade);
+  }
+  if (inkA > 0.0){
+    vec3 ink = vec3(0.05, 0.045, 0.04);
+    col = mix(col, ink, inkA);
+    col = mix(col, ink + vec3(0.02, 0.015, 0.01), inkA * 0.3);   // warm cast where it pools
+    col += (tooth - 0.5) * inkA * 0.10;                          // grain reads through
+  }
 
   // --- finish ---
   // vignette
@@ -334,9 +423,20 @@ const PALETTE = [
   [0.10, 0.35, 0.90], // indigo deep
 ];
 
+// spiffy2's muted pigment wheel: big stains stay quieter than the splashes
+const STAIN_PALETTE = [
+  [0.16, 0.26, 0.56], // indigo
+  [0.10, 0.50, 0.55], // teal
+  [0.60, 0.20, 0.50], // magenta
+  [0.78, 0.22, 0.30], // crimson
+  [0.85, 0.55, 0.15], // amber
+  [0.16, 0.45, 0.30], // forest
+];
+
 const rnd = (a, b) => a + Math.random() * (b - a);
 const clamp01 = v => v < 0 ? 0 : v > 1 ? 1 : v;
 const pick = () => PALETTE[(Math.random() * PALETTE.length) | 0];
+const pickStain = () => STAIN_PALETTE[(Math.random() * STAIN_PALETTE.length) | 0];
 
 function inkColor(base){
   const p = base || pick();
@@ -347,7 +447,7 @@ function inkColor(base){
 
 const drops = [];
 const queue = [];                 // splashes waiting their turn
-let time = 0, nextSpawn = 0;
+let time = 0, nextSpawn = 0, nextStain = 4.0;
 let paused = false;
 let frameCount = 0, lastFpsTime = 0, fps = 0;
 
@@ -355,23 +455,32 @@ function schedule(delay, o){ queue.push({ at: time + delay, o: o || {} }); }
 
 function spawn(o){
   o = o || {};
+  const soft = o.soft ? 1 : 0;
+  const x = o.x !== undefined ? o.x : rnd(0.04, 0.96);
+  const y = o.y !== undefined ? o.y : rnd(0.06, 0.94);
   drops.push({
-    x: o.x !== undefined ? o.x : rnd(0.04, 0.96),
-    baseY: o.y !== undefined ? o.y : rnd(0.06, 0.94),
+    baseX: x,
+    baseY: y,
     rMax: o.rMax !== undefined ? o.rMax
         : (Math.random() < 0.14 ? rnd(0.13, 0.20) : rnd(0.045, 0.115)),
     hitT: time,
     seed: rnd(0, 90),
     col: o.col || inkColor(o.base),
-    tendrilMax: rnd(0.30, 0.85),
-    load: rnd(0.85, 1.35),            // how much pigment this drop carries
-    sag: rnd(0.004, 0.020),           // gravity pull on the settling bloom
+    soft,
+    fall: o.fall || 0,                // seconds spent in the air before soaking
+    fromY: o.fromY !== undefined ? o.fromY : y,
+    fragMax: o.frag !== undefined ? o.frag : rnd(0.0, 0.18),
+    tendrilMax: o.tendrilMax !== undefined ? o.tendrilMax : rnd(0.30, 0.85),
+    aspect: o.aspect !== undefined ? o.aspect : 1.0,   // permanent squash bias
+    bake: o.bake !== undefined ? o.bake : BAKE_AGE,
+    load: o.load !== undefined ? o.load : rnd(0.85, 1.35),   // pigment carried
+    sag: o.sag !== undefined ? o.sag : rnd(0.004, 0.020),    // gravity pull while settling
     splat: rnd(0.18, 0.36),           // how flat the initial impact spreads it
     wobW: rnd(12.0, 19.0),            // settling wobble rate
     satellites: o.satellites !== undefined ? o.satellites
               : (Math.random() < 0.55 ? 1 + ((Math.random() * 2) | 0) : 0),
     splashed: false,
-    y: 0, r: 0, squash: 1, tendril: 0, strength: 0, wet: 1
+    x: x, y: y, r: 0, squash: 1, tendril: 0, frag: 0, strength: 0
   });
 }
 
@@ -390,30 +499,142 @@ function cluster(x, y){
   }
 }
 
-// returns seconds since impact
+// spiffy.html: an impact that shatters outward into small, torn, elongated shards
+function splash(x, y){
+  const base = pick(), alt = pick();
+  schedule(0, { x: clamp01(x), y: clamp01(y), rMax: rnd(0.06, 0.115),
+                base, frag: rnd(0.28, 0.50), tendrilMax: rnd(0.55, 1.05), satellites: 0 });
+
+  const n = 8 + ((Math.random() * 8) | 0);
+  for (let i = 0; i < n; i++){
+    const a = (i / n) * 6.283 + rnd(-0.30, 0.30);
+    const dist = 0.05 + Math.pow(Math.random(), 0.55) * 0.24;
+    schedule(rnd(0.0, 0.20), {
+      x: clamp01(x + Math.cos(a) * dist),
+      y: clamp01(y + Math.sin(a) * dist * 0.82),
+      rMax: rnd(0.008, 0.042),
+      base: Math.random() < 0.72 ? base : alt,
+      frag: rnd(0.55, 1.0),                 // torn to pieces at the rim
+      tendrilMax: rnd(0.70, 1.40),          // long capillary fingers off each shard
+      aspect: rnd(0.45, 1.85),              // flung shards are not round
+      load: rnd(0.70, 1.15),
+      bake: rnd(1.6, 2.6),                  // small and thin, so they dry fast
+      satellites: 0
+    });
+  }
+}
+
+// spiffy2.html: a fat drop falls in from off-screen, lands, and soaks out huge
+function bigStain(){
+  spawn({
+    x: rnd(0.10, 0.90),
+    y: rnd(0.18, 0.78),
+    rMax: rnd(0.22, 0.42),
+    base: pickStain(),
+    soft: true,
+    fall: rnd(0.8, 1.4),
+    fromY: 1.14,
+    load: rnd(0.46, 0.80),
+    sag: rnd(0.010, 0.030),
+    bake: rnd(8.0, 11.0),
+    satellites: 0,
+    frag: 0
+  });
+}
+
+function stainCount(){
+  let n = 0;
+  for (let i = 0; i < drops.length; i++) if (drops[i].soft) n++;
+  return n;
+}
+
+// returns seconds since the drop landed (negative while it is still falling)
 function updateDrop(d){
   const a = time - d.hitT;
+
+  if (d.fall > 0 && a < d.fall){
+    const ft = a / d.fall;
+    d.x = d.baseX + Math.sin(ft * 5.0 + d.seed) * 0.008;
+    d.y = d.fromY + (d.baseY - d.fromY) * ft * ft;   // accelerating like gravity
+    d.r = d.rMax * (0.10 + 0.10 * ft);
+    d.squash = 2.10 - 0.90 * ft;                     // stretched streak, relaxing on impact
+    d.tendril = 0;
+    d.frag = 0;
+    d.strength = 0.45 * d.load;
+    return a - d.fall;
+  }
+
+  const s = a - d.fall;
+  d.x = d.baseX;
 
   if (!d.splashed){
     d.splashed = true;
     for (let i = 0; i < d.satellites; i++){
       const ang = rnd(0, 6.283), dist = d.rMax * rnd(1.3, 2.8);
       schedule(rnd(0.03, 0.14), {                       // flung off, landing just after
-        x: clamp01(d.x + Math.cos(ang) * dist),
+        x: clamp01(d.baseX + Math.cos(ang) * dist),
         y: clamp01(d.baseY + Math.sin(ang) * dist * 0.8),
         rMax: d.rMax * rnd(0.10, 0.30), col: d.col, satellites: 0
       });
     }
   }
 
-  const e = 1.0 - Math.exp(-a * 2.2);                                     // bloom
-  d.r = d.rMax * (0.34 + 0.66 * e) * (1.0 + 0.11 * Math.exp(-a * 3.2) * Math.sin(a * 14.0));
-  d.squash = 1.0 - d.splat * Math.exp(-a * 4.5) * Math.cos(a * d.wobW);   // pancake, then settle
+  const e = 1.0 - Math.exp(-s * (d.soft ? 0.55 : 2.2));   // settle curve: slow soak / fast bloom
+
+  if (d.soft){
+    d.r = d.rMax * (0.16 + 0.84 * e);
+    d.squash = d.aspect * (1.0 - 0.12 * Math.exp(-s * 1.2));
+    d.tendril = 0;
+    d.frag = 0;
+    d.strength = (0.35 + 0.65 * e) * d.load;
+  } else {
+    d.r = d.rMax * (0.34 + 0.66 * e) * (1.0 + 0.11 * Math.exp(-s * 3.2) * Math.sin(s * 14.0));
+    d.squash = d.aspect * (1.0 - d.splat * Math.exp(-s * 4.5) * Math.cos(s * d.wobW));
+    d.tendril = d.tendrilMax * (0.22 + 0.78 * e);
+    d.frag = d.fragMax * (0.35 + 0.65 * e);            // shards tear apart as they spread
+    d.strength = (0.55 + 0.55 * e) * d.load;
+  }
   d.y = d.baseY - d.sag * e;
-  d.tendril = d.tendrilMax * (0.22 + 0.78 * e);
-  d.strength = (0.55 + 0.55 * e) * d.load;
-  d.wet = Math.max(0.0, Math.exp(-a * 1.15) - 0.045) / 0.955;             // reaches 0 before baking
-  return a;
+  return s;
+}
+
+// ================================================================ concentric rings
+
+const rings = [];
+let nextRing = 1.2;
+
+// 1 while the ring is alive, easing to 0 across RING_RETIRE once it is retired
+function ringFade(r){
+  if (!r.retired) return 1.0;
+  const k = (time - r.retired) / RING_RETIRE;
+  return k >= 1.0 ? 0.0 : 1.0 - k * k * (3.0 - 2.0 * k);
+}
+
+function addRing(px, py){
+  // Never yank a visible ring: retire the oldest and let it fade in a spare slot.
+  let live = 0;
+  for (let i = 0; i < rings.length; i++) if (!rings[i].retired) live++;
+  if (live >= RING_CAP){
+    let oldest = -1;
+    for (let i = 0; i < rings.length; i++){
+      if (!rings[i].retired && (oldest < 0 || rings[i].t0 < rings[oldest].t0)) oldest = i;
+    }
+    if (oldest >= 0) rings[oldest].retired = time;
+  }
+  // click spam can still outrun the spare slots; drop the faintest, never a fresh one
+  while (rings.length >= MAXR){
+    let faint = 0;
+    for (let i = 1; i < rings.length; i++){
+      if (ringFade(rings[i]) < ringFade(rings[faint])) faint = i;
+    }
+    rings.splice(faint, 1);
+  }
+  rings.push({ x: px, y: py, seed: Math.random(), t0: time, retired: 0 });
+}
+
+function autoRing(){
+  const halfX = 0.5 * (W / H);
+  addRing(rnd(-halfX, halfX) * 0.85, rnd(-0.5, 0.5) * 0.85);
 }
 
 // ================================================================ render
@@ -421,14 +642,26 @@ function updateDrop(d){
 const bufA = new Float32Array(MAXD * 4);
 const bufB = new Float32Array(MAXD * 4);
 const bufC = new Float32Array(MAXD * 4);
+const bufR = new Float32Array(MAXR * 4);
+const bufRB = new Float32Array(MAXR * 4);
 
 function pack(list){
   const n = Math.min(list.length, MAXD);
   for (let i = 0; i < n; i++){
     const d = list[i], o = i * 4;
-    bufA[o] = d.x;        bufA[o+1] = d.y;    bufA[o+2] = d.r;      bufA[o+3] = d.seed;
-    bufB[o] = d.strength; bufB[o+1] = d.wet;  bufB[o+2] = d.squash; bufB[o+3] = d.tendril;
-    bufC[o] = d.col[0];   bufC[o+1] = d.col[1]; bufC[o+2] = d.col[2]; bufC[o+3] = 1;
+    bufA[o] = d.x;        bufA[o+1] = d.y;      bufA[o+2] = d.r;      bufA[o+3] = d.seed;
+    bufB[o] = d.strength; bufB[o+1] = d.frag;   bufB[o+2] = d.squash; bufB[o+3] = d.tendril;
+    bufC[o] = d.col[0];   bufC[o+1] = d.col[1]; bufC[o+2] = d.col[2]; bufC[o+3] = d.soft;
+  }
+  return n;
+}
+
+function packRings(){
+  const n = Math.min(rings.length, MAXR);
+  for (let i = 0; i < n; i++){
+    const r = rings[i], o = i * 4;
+    bufR[o] = r.x; bufR[o+1] = r.y; bufR[o+2] = time - r.t0; bufR[o+3] = r.seed;
+    bufRB[o] = ringFade(r);
   }
   return n;
 }
@@ -454,7 +687,8 @@ function frame(now){
     fps = frameCount;
     frameCount = 0;
     lastFpsTime = now;
-    document.getElementById('stats').textContent = `drops: ${drops.length} | queue: ${queue.length} | fps: ${fps} | ${paused ? 'PAUSED' : 'running'}`;
+    document.getElementById('stats').textContent =
+      `drops: ${drops.length} | rings: ${rings.length} | queue: ${queue.length} | fps: ${fps} | ${paused ? 'PAUSED' : 'running'}`;
   }
 
   // update, then split into still-wet (drawn live) and settled (stamped down)
@@ -470,10 +704,24 @@ function frame(now){
       nextSpawn = time + rnd(AUTO_SPAWN_MIN, AUTO_SPAWN_MAX);
       spawn();
     }
+    if (time > nextStain){
+      nextStain = time + rnd(STAIN_MIN, STAIN_MAX);
+      if (stainCount() < STAIN_ALIVE) bigStain();
+    }
+    if (time > nextRing){
+      nextRing = time + RING_STAGGER * rnd(0.7, 1.4);
+      autoRing();
+    }
+    for (let i = rings.length - 1; i >= 0; i--){
+      const r = rings[i];
+      if (time - r.t0 >= RING_LIFE || (r.retired && time - r.retired >= RING_RETIRE)) {
+        rings.splice(i, 1);
+      }
+    }
 
     for (let i = drops.length - 1; i >= 0; i--){
       const d = drops[i];
-      if (updateDrop(d) >= BAKE_AGE){
+      if (updateDrop(d) >= d.bake){
         bake.push(d);
         drops.splice(i, 1);
       } else {
@@ -533,6 +781,10 @@ function frame(now){
   gl.bindTexture(gl.TEXTURE_2D, tex[cur]);
   gl.uniform1i(progMain.loc.uAccum, 0);
   uploadDrops(progMain, pack(wet));
+  const nRings = packRings();
+  gl.uniform4fv(progMain.loc.uRing, bufR);
+  gl.uniform4fv(progMain.loc.uRingB, bufRB);
+  gl.uniform1i(progMain.loc.uRingCount, nRings);
   gl.drawArrays(gl.TRIANGLES, 0, 3);
 
   requestAnimationFrame(frame);
@@ -544,13 +796,17 @@ const hint = document.getElementById('hint');
 
 canvas.addEventListener('pointerdown', e => {
   const r = canvas.getBoundingClientRect();
-  cluster((e.clientX - r.left) / r.width, 1.0 - (e.clientY - r.top) / r.height);
+  const ux = (e.clientX - r.left) / r.width;
+  const uy = 1.0 - (e.clientY - r.top) / r.height;
+  cluster(ux, uy);
+  splash(ux, uy);
+  addRing((ux - 0.5) * (W / H), uy - 0.5);
   hint.classList.add('gone');
 });
 
 window.addEventListener('keydown', e => {
   if (e.key === 'c' || e.key === 'C'){
-    drops.length = 0; queue.length = 0; clearPaper();
+    drops.length = 0; queue.length = 0; rings.length = 0; clearPaper();
   }
   if (e.key === ' '){
     paused = !paused;
@@ -562,6 +818,7 @@ window.addEventListener('keydown', e => {
 for (let i = 0; i < INITIAL_BURST; i++) {
   setTimeout(() => spawn(), i * 180);
 }
+setTimeout(() => bigStain(), 900);
 
 requestAnimationFrame(() => hint.classList.add('gone'));
 requestAnimationFrame(frame);
