@@ -1,0 +1,505 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Splotty — Alcohol Marker Bloom</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; overflow: hidden; background: #f7f5f0; }
+  canvas { display: block; width: 100vw; height: 100vh; cursor: crosshair; touch-action: none; }
+  #hint {
+    position: fixed; left: 50%; bottom: 28px; transform: translateX(-50%);
+    font: 400 11px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
+    letter-spacing: .18em; text-transform: uppercase;
+    color: rgba(40,32,28,.40); pointer-events: none; user-select: none;
+    transition: opacity 1.6s ease 3.5s; opacity: 1;
+  }
+  #hint.gone { opacity: 0; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hint">click to bloom &nbsp;·&nbsp; c to clear</div>
+<script>
+"use strict";
+
+const canvas = document.getElementById('c');
+const gl = canvas.getContext('webgl2', { alpha: false, antialias: false });
+if (!gl) { document.body.innerHTML = '<p style="font:14px system-ui;padding:2rem">WebGL2 is required.</p>'; throw new Error('no webgl2'); }
+
+const MAXD      = 28;     // drops handled per shader pass
+const BAKE_AGE  = 3.0;    // seconds after a splash before it is stamped into the paper
+const FADE_TIME = 30.0;   // seconds for a splash to fade all the way back to paper white
+
+// ================================================================ shaders
+
+const HEAD = '#version 300 es\nprecision highp float;\n#define MAXD ' + MAXD + '\n';
+
+const COMMON = `
+uniform vec2 uRes;
+uniform vec4 uA[MAXD];   // xy center (uv) | z radius (y-units) | w seed
+uniform vec4 uB[MAXD];   // x strength | y wetness | z squash | w tendril amount
+uniform vec4 uC[MAXD];   // rgb ink transmission colour
+uniform int  uCount;
+
+float hash21(vec2 p){
+  p = fract(p * vec2(123.34, 456.21));
+  p += dot(p, p + 45.32);
+  return fract(p.x * p.y);
+}
+
+float vnoise(vec2 p){
+  vec2 i = floor(p), f = fract(p);
+  vec2 u = f * f * (3.0 - 2.0 * f);
+  float a = hash21(i);
+  float b = hash21(i + vec2(1.0, 0.0));
+  float c = hash21(i + vec2(0.0, 1.0));
+  float d = hash21(i + vec2(1.0, 1.0));
+  return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+}
+
+float fbm(vec2 p){
+  float s = 0.0, a = 0.5;
+  for (int i = 0; i < 4; i++){
+    s += a * vnoise(p);
+    p = p * 2.03 + 17.13;
+    a *= 0.5;
+  }
+  return s;
+}
+
+// Paper tooth is fixed in screen space, so every layer pools into the same fibres.
+float paperTooth(vec2 uv, float asp){
+  vec2 q = vec2(uv.x * asp, uv.y);
+  return fbm(q * 68.0) * 0.62 + fbm(q * 11.0 + 5.0) * 0.38;
+}
+
+// Pigment density of one drop at aspect-corrected offset p (y up).
+float dropDensity(vec2 p, float R, float seed, float squash, float tendril, float tooth){
+  p.y /= max(squash, 0.05);
+  if (dot(p, p) > R * R * 9.0) return 0.0;
+
+  vec2 sp = p / max(R, 1e-5);
+  float ang = atan(sp.y, sp.x);
+  vec2 ac = vec2(cos(ang), sin(ang));      // seamless sampling around the rim
+
+  // domain warp -> lopsided, hand-blotted silhouette
+  vec2 w = vec2(fbm(sp * 1.55 + seed), fbm(sp * 1.55 + seed + 31.7)) - 0.5;
+  float d = length(sp + w * 0.30);
+
+  // capillary tendrils: sparse sharp fingers creeping out along the grain
+  float n1 = fbm(ac * 3.1 + seed * 1.7);
+  float n2 = fbm(ac * 9.3 + seed * 3.1);
+  float spikes = pow(clamp(n1 * 0.78 + n2 * 0.52 - 0.34, 0.0, 1.0), 1.7) * 2.2;
+  float edge = 1.0 + tendril * (0.52 * spikes + 0.12 * (n1 - 0.5));
+
+  float body   = smoothstep(edge, edge - 0.30, d);            // solid mass
+  float halo   = smoothstep(edge * 1.80, edge * 0.42, d);     // wide translucent bleed
+  float ring   = exp(-pow((d - edge * 0.93) / 0.115, 2.0));   // pigment pooling at the rim
+  float thread = smoothstep(edge * (1.0 + tendril * 1.05), edge * 0.98, d) * spikes;
+
+  float dens = body * 0.86 + halo * 0.19 + ring * 0.52 + thread * 0.30;
+  return dens * (0.82 + 0.36 * tooth);                        // granulation
+}
+
+// Beer-Lambert: ink transmitting colour col absorbs (1 - col)
+vec3 pigment(float dens, vec3 col){
+  return exp(-dens * (1.0 - col) * 2.35);
+}
+`;
+
+const VERT = HEAD + `
+void main(){
+  vec2 p = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);
+  gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+}`;
+
+// settled drops, stamped permanently into the paper.  blend: dst *= src
+const FRAG_BAKE = HEAD + COMMON + `
+out vec4 fragColor;
+void main(){
+  vec2 uv = gl_FragCoord.xy / uRes;
+  float asp = uRes.x / uRes.y;
+  float tooth = paperTooth(uv, asp);
+  vec3 T = vec3(1.0);
+  for (int i = 0; i < MAXD; i++){
+    if (i >= uCount) break;
+    vec2 p = vec2((uv.x - uA[i].x) * asp, uv.y - uA[i].y);
+    float dens = dropDensity(p, uA[i].z, uA[i].w, uB[i].z, uB[i].w, tooth) * uB[i].x;
+    if (dens <= 0.0) continue;
+    T *= pigment(dens, uC[i].rgb);
+  }
+  fragColor = vec4(T, 1.0);
+}`;
+
+// evaporation: every stain walks back toward paper white at a fixed rate, clamped at 1
+const FRAG_FADE = HEAD + `
+out vec4 fragColor;
+uniform sampler2D uSrc;
+uniform vec2 uRes;
+uniform float uAmt;
+void main(){
+  fragColor = vec4(min(texture(uSrc, gl_FragCoord.xy / uRes).rgb + uAmt, vec3(1.0)), 1.0);
+}`;
+
+const FRAG_MAIN = HEAD + COMMON + `
+out vec4 fragColor;
+uniform sampler2D uAccum;
+uniform float uTime;
+
+// 3x3 gaussian + a whisper of pigment separation
+vec3 sampleStain(vec2 uv){
+  vec2 px = 1.35 / uRes;
+  vec3 s = texture(uAccum, uv).rgb * 4.0;
+  s += (texture(uAccum, uv + vec2(px.x, 0.0)).rgb +
+        texture(uAccum, uv - vec2(px.x, 0.0)).rgb +
+        texture(uAccum, uv + vec2(0.0, px.y)).rgb +
+        texture(uAccum, uv - vec2(0.0, px.y)).rgb) * 2.0;
+  s += texture(uAccum, uv + px).rgb +
+       texture(uAccum, uv - px).rgb +
+       texture(uAccum, uv + vec2(px.x, -px.y)).rgb +
+       texture(uAccum, uv - vec2(px.x, -px.y)).rgb;
+  s /= 16.0;
+
+  s.r = mix(s.r, texture(uAccum, uv + px * 1.15).r, 0.30);
+  s.b = mix(s.b, texture(uAccum, uv - px * 1.15).b, 0.30);
+  return s;
+}
+
+void main(){
+  vec2 uv = gl_FragCoord.xy / uRes;
+  float asp = uRes.x / uRes.y;
+  float tooth = paperTooth(uv, asp);
+
+  // --- cold-press paper ---
+  float cloud = fbm(vec2(uv.x * asp, uv.y) * 3.7 + 12.0);
+  vec3 paper = vec3(0.988, 0.981, 0.968);
+  paper *= 0.962 + tooth * 0.052 + (cloud - 0.5) * 0.030;
+
+  vec3 col = paper * sampleStain(uv);
+
+  // --- drops still wet on the surface ---
+  vec3 sheen = vec3(0.0);
+  for (int i = 0; i < MAXD; i++){
+    if (i >= uCount) break;
+    float R = uA[i].z, squash = uB[i].z;
+    vec2 p = vec2((uv.x - uA[i].x) * asp, uv.y - uA[i].y);
+    float dens = dropDensity(p, R, uA[i].w, squash, uB[i].w, tooth) * uB[i].x;
+    if (dens <= 0.0) continue;
+
+    col *= pigment(dens, uC[i].rgb);
+
+    float wet = uB[i].y;
+    if (wet > 0.002){
+      float core = smoothstep(0.05, 0.42, dens);
+      vec2 sp = (vec2(p.x, p.y / max(squash, 0.05)) - vec2(-0.30, 0.33) * R) / max(R, 1e-5);
+      sheen += vec3(1.0, 0.995, 0.975) * exp(-dot(sp, sp) * 6.5) * core * wet * 0.52;
+      sheen += vec3(0.86, 0.93, 1.0) * core * wet * 0.055;      // broad gloss
+    }
+  }
+  col += sheen;
+
+  // --- finish ---
+  col *= 1.0 - 0.16 * pow(length((uv - 0.5) * vec2(asp * 0.95, 1.0)), 2.4);
+  col += (hash21(gl_FragCoord.xy + fract(uTime) * 91.7) - 0.5) * 0.014;
+
+  fragColor = vec4(clamp(col, 0.0, 1.0), 1.0);
+}`;
+
+// ================================================================ gl setup
+
+function compile(type, src){
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s) + '\n' + src);
+  return s;
+}
+
+function program(fragSrc){
+  const p = gl.createProgram();
+  gl.attachShader(p, compile(gl.VERTEX_SHADER, VERT));
+  gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fragSrc));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  const loc = {};
+  const n = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS);
+  for (let i = 0; i < n; i++){
+    const name = gl.getActiveUniform(p, i).name.replace(/\[0\]$/, '');
+    loc[name] = gl.getUniformLocation(p, name);
+  }
+  return { p, loc };
+}
+
+const progMain = program(FRAG_MAIN);
+const progBake = program(FRAG_BAKE);
+const progFade = program(FRAG_FADE);
+
+gl.bindVertexArray(gl.createVertexArray());
+
+const hasFloat = !!gl.getExtension('EXT_color_buffer_float');
+const tex = [null, null];
+const fb  = [gl.createFramebuffer(), gl.createFramebuffer()];
+let cur = 0, W = 0, H = 0;
+
+function clearPaper(){
+  gl.disable(gl.BLEND);
+  gl.clearColor(1, 1, 1, 1);
+  for (let i = 0; i < 2; i++){
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fb[i]);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+  }
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+}
+
+function resize(){
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  W = Math.max(2, Math.round(window.innerWidth * dpr));
+  H = Math.max(2, Math.round(window.innerHeight * dpr));
+  canvas.width = W; canvas.height = H;
+
+  for (let i = 0; i < 2; i++){
+    if (tex[i]) gl.deleteTexture(tex[i]);
+    tex[i] = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, tex[i]);
+    gl.texImage2D(gl.TEXTURE_2D, 0, hasFloat ? gl.RGBA16F : gl.RGBA8, W, H, 0, gl.RGBA,
+                  hasFloat ? gl.HALF_FLOAT : gl.UNSIGNED_BYTE, null);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fb[i]);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex[i], 0);
+  }
+  gl.viewport(0, 0, W, H);
+  clearPaper();
+}
+window.addEventListener('resize', resize);
+resize();
+
+// ================================================================ droplets
+
+const PALETTE = [
+  [0.93, 0.10, 0.52], // magenta
+  [0.86, 0.08, 0.68], // fuchsia
+  [0.82, 0.06, 0.30], // crimson
+  [0.55, 0.12, 0.78], // purple
+  [0.38, 0.16, 0.86], // violet
+  [0.16, 0.34, 0.92], // indigo
+  [0.06, 0.62, 0.92], // cyan
+  [0.04, 0.78, 0.76], // teal
+  [0.10, 0.74, 0.48], // viridian
+  [0.98, 0.48, 0.06], // orange
+  [0.96, 0.24, 0.13], // vermilion
+  [0.99, 0.70, 0.10], // amber
+];
+
+const rnd = (a, b) => a + Math.random() * (b - a);
+const clamp01 = v => v < 0 ? 0 : v > 1 ? 1 : v;
+const pick = () => PALETTE[(Math.random() * PALETTE.length) | 0];
+
+function inkColor(base){
+  const p = base || pick();
+  return [clamp01(p[0] + rnd(-0.06, 0.06)),
+          clamp01(p[1] + rnd(-0.06, 0.06)),
+          clamp01(p[2] + rnd(-0.06, 0.06))];
+}
+
+const drops = [];
+const queue = [];                 // splashes waiting their turn
+let time = 0, nextSpawn = 0;
+
+function schedule(delay, o){ queue.push({ at: time + delay, o: o || {} }); }
+
+function spawn(o){
+  o = o || {};
+  drops.push({
+    x: o.x !== undefined ? o.x : rnd(0.04, 0.96),
+    baseY: o.y !== undefined ? o.y : rnd(0.06, 0.94),
+    rMax: o.rMax !== undefined ? o.rMax
+        : (Math.random() < 0.14 ? rnd(0.13, 0.20) : rnd(0.045, 0.115)),
+    hitT: time,
+    seed: rnd(0, 90),
+    col: o.col || inkColor(o.base),
+    tendrilMax: rnd(0.30, 0.85),
+    load: rnd(0.85, 1.35),            // how much pigment this drop carries
+    sag: rnd(0.004, 0.020),           // gravity pull on the settling bloom
+    splat: rnd(0.18, 0.36),           // how flat the initial impact spreads it
+    wobW: rnd(12.0, 19.0),            // settling wobble rate
+    satellites: o.satellites !== undefined ? o.satellites
+              : (Math.random() < 0.55 ? 1 + ((Math.random() * 2) | 0) : 0),
+    splashed: false,
+    y: 0, r: 0, squash: 1, tendril: 0, strength: 0, wet: 1
+  });
+}
+
+function cluster(x, y){
+  const base = pick(), alt = pick();
+  const n = 5 + ((Math.random() * 5) | 0);
+  for (let i = 0; i < n; i++){
+    const a = rnd(0, 6.283);
+    const rad = Math.pow(Math.random(), 0.65) * 0.16;
+    schedule(i === 0 ? 0 : rnd(0.02, 0.26), {
+      x: clamp01(x + Math.cos(a) * rad),
+      y: clamp01(y + Math.sin(a) * rad * 0.75),
+      rMax: i === 0 ? rnd(0.09, 0.155) : rnd(0.025, 0.095),
+      base: Math.random() < 0.7 ? base : alt
+    });
+  }
+}
+
+// returns seconds since impact
+function updateDrop(d){
+  const a = time - d.hitT;
+
+  if (!d.splashed){
+    d.splashed = true;
+    for (let i = 0; i < d.satellites; i++){
+      const ang = rnd(0, 6.283), dist = d.rMax * rnd(1.3, 2.8);
+      schedule(rnd(0.03, 0.14), {                       // flung off, landing just after
+        x: clamp01(d.x + Math.cos(ang) * dist),
+        y: clamp01(d.baseY + Math.sin(ang) * dist * 0.8),
+        rMax: d.rMax * rnd(0.10, 0.30), col: d.col, satellites: 0
+      });
+    }
+  }
+
+  const e = 1.0 - Math.exp(-a * 2.2);                                     // bloom
+  d.r = d.rMax * (0.34 + 0.66 * e) * (1.0 + 0.11 * Math.exp(-a * 3.2) * Math.sin(a * 14.0));
+  d.squash = 1.0 - d.splat * Math.exp(-a * 4.5) * Math.cos(a * d.wobW);   // pancake, then settle
+  d.y = d.baseY - d.sag * e;
+  d.tendril = d.tendrilMax * (0.22 + 0.78 * e);
+  d.strength = (0.55 + 0.55 * e) * d.load;
+  d.wet = Math.max(0.0, Math.exp(-a * 1.15) - 0.045) / 0.955;             // reaches 0 before baking
+  return a;
+}
+
+// ================================================================ render
+
+const bufA = new Float32Array(MAXD * 4);
+const bufB = new Float32Array(MAXD * 4);
+const bufC = new Float32Array(MAXD * 4);
+
+function pack(list){
+  const n = Math.min(list.length, MAXD);
+  for (let i = 0; i < n; i++){
+    const d = list[i], o = i * 4;
+    bufA[o] = d.x;        bufA[o+1] = d.y;    bufA[o+2] = d.r;      bufA[o+3] = d.seed;
+    bufB[o] = d.strength; bufB[o+1] = d.wet;  bufB[o+2] = d.squash; bufB[o+3] = d.tendril;
+    bufC[o] = d.col[0];   bufC[o+1] = d.col[1]; bufC[o+2] = d.col[2]; bufC[o+3] = 1;
+  }
+  return n;
+}
+
+function uploadDrops(pr, n){
+  gl.uniform4fv(pr.loc.uA, bufA);
+  gl.uniform4fv(pr.loc.uB, bufB);
+  gl.uniform4fv(pr.loc.uC, bufC);
+  gl.uniform1i(pr.loc.uCount, n);
+}
+
+let last = performance.now() / 1000;
+let pendingFade = 0;
+
+function frame(now){
+  now /= 1000;
+  const dt = Math.min(now - last, 0.05);
+  last = now;
+  time += dt;
+
+  for (let i = queue.length - 1; i >= 0; i--){
+    if (time >= queue[i].at){ spawn(queue[i].o); queue.splice(i, 1); }
+  }
+  if (time > nextSpawn){
+    nextSpawn = time + rnd(0.45, 1.30);
+    spawn();
+  }
+
+  // update, then split into still-wet (drawn live) and settled (stamped down)
+  const wet = [], bake = [];
+  for (let i = drops.length - 1; i >= 0; i--){
+    const d = drops[i];
+    if (updateDrop(d) >= BAKE_AGE){
+      bake.push(d);
+      drops.splice(i, 1);
+    } else {
+      wet.push(d);
+    }
+  }
+  // hard cap: retire the oldest wet drops (newest are first, having iterated backwards)
+  while (wet.length > MAXD){
+    const d = wet.pop();
+    const k = drops.indexOf(d);
+    if (k >= 0) drops.splice(k, 1);
+    bake.push(d);
+  }
+
+  gl.disable(gl.DEPTH_TEST);
+  gl.viewport(0, 0, W, H);
+
+  // evaporation: a fully saturated channel reaches paper white in FADE_TIME seconds
+  pendingFade += dt / FADE_TIME;
+  if (pendingFade > (hasFloat ? 0.0 : 0.006)){
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fb[cur ^ 1]);
+    gl.disable(gl.BLEND);
+    gl.useProgram(progFade.p);
+    gl.uniform2f(progFade.loc.uRes, W, H);
+    gl.uniform1f(progFade.loc.uAmt, pendingFade);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, tex[cur]);
+    gl.uniform1i(progFade.loc.uSrc, 0);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    cur ^= 1;
+    pendingFade = 0;
+  }
+
+  // stamp settled drops: dst *= transmittance
+  if (bake.length){
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fb[cur]);
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.ZERO, gl.SRC_COLOR);
+    gl.useProgram(progBake.p);
+    gl.uniform2f(progBake.loc.uRes, W, H);
+    uploadDrops(progBake, pack(bake));
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    for (let i = MAXD; i < bake.length; i++) drops.push(bake[i]);   // overflow waits a frame
+  }
+
+  // composite
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.viewport(0, 0, W, H);
+  gl.disable(gl.BLEND);
+  gl.useProgram(progMain.p);
+  gl.uniform2f(progMain.loc.uRes, W, H);
+  gl.uniform1f(progMain.loc.uTime, time);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, tex[cur]);
+  gl.uniform1i(progMain.loc.uAccum, 0);
+  uploadDrops(progMain, pack(wet));
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+  requestAnimationFrame(frame);
+}
+
+// ================================================================ input
+
+const hint = document.getElementById('hint');
+
+canvas.addEventListener('pointerdown', e => {
+  const r = canvas.getBoundingClientRect();
+  cluster((e.clientX - r.left) / r.width, 1.0 - (e.clientY - r.top) / r.height);
+  hint.classList.add('gone');
+});
+
+window.addEventListener('keydown', e => {
+  if (e.key === 'c' || e.key === 'C'){ drops.length = 0; queue.length = 0; clearPaper(); }
+});
+
+requestAnimationFrame(() => hint.classList.add('gone'));
+
+for (let i = 0; i < 6; i++) schedule(rnd(0.0, 1.4));        // never opens blank
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

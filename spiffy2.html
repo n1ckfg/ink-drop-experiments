@@ -1,0 +1,360 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>watercolor</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    background: #f4f1ea;
+  }
+  #c {
+    position: fixed;
+    inset: 0;
+    display: block;
+    width: 100%;
+    height: 100%;
+    touch-action: none;
+  }
+  #caption {
+    position: fixed;
+    left: 18px;
+    bottom: 14px;
+    font: 300 12px/1 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    letter-spacing: 0.18em;
+    color: rgba(60, 55, 48, 0.35);
+    pointer-events: none;
+    user-select: none;
+    z-index: 2;
+  }
+  #msg {
+    display: none;
+    position: fixed;
+    inset: 0;
+    z-index: 3;
+    align-items: center;
+    justify-content: center;
+    font: 400 14px/1.5 ui-monospace, Menlo, Consolas, monospace;
+    color: #555;
+    background: #f4f1ea;
+    text-align: center;
+    padding: 20px;
+  }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="caption">watercolor</div>
+<div id="msg">WebGL is not available in this browser.</div>
+
+<script>
+(function () {
+  "use strict";
+
+  const canvas = document.getElementById("c");
+  const gl = canvas.getContext("webgl", {
+    antialias: false,
+    alpha: false,
+    depth: false,
+    stencil: false,
+    preserveDrawingBuffer: false,
+    powerPreference: "high-performance"
+  });
+
+  if (!gl) {
+    document.getElementById("msg").style.display = "flex";
+    return;
+  }
+
+  // ---------------------------------------------------------------- shaders
+  const VS = `
+    attribute vec2 aPos;
+    varying vec2 vUv;
+    void main() {
+      vUv = aPos * 0.5 + 0.5;
+      gl_Position = vec4(aPos, 0.0, 1.0);
+    }
+  `;
+
+  // Simulation pass: advect/bleed the accumulated ink field and inject drops.
+  // Ink is stored as per-channel light absorption (0..1), so overlapping
+  // colors mix subtractively like real pigment.
+  const SIM_FS = `
+    #ifdef GL_FRAGMENT_PRECISION_HIGH
+    precision highp float;
+    #else
+    precision mediump float;
+    #endif
+    varying vec2 vUv;
+    uniform sampler2D uPrev;
+    uniform vec2  uRes;
+    uniform float uTime;
+    uniform float uBleed;
+    uniform float uDry;
+
+    float hash(float n) { return fract(sin(n * 127.1) * 43758.5453123); }
+
+    vec3 watercolor(float t) {
+      vec3 c1 = vec3(0.16, 0.26, 0.56); // indigo
+      vec3 c2 = vec3(0.10, 0.50, 0.55); // teal
+      vec3 c3 = vec3(0.60, 0.20, 0.50); // magenta
+      vec3 c4 = vec3(0.78, 0.22, 0.30); // crimson
+      vec3 c5 = vec3(0.85, 0.55, 0.15); // amber
+      vec3 c6 = vec3(0.16, 0.45, 0.30); // forest
+      float f = t * 6.0;
+      if (f < 1.0) return mix(c1, c2, f);
+      if (f < 2.0) return mix(c2, c3, f - 1.0);
+      if (f < 3.0) return mix(c3, c4, f - 2.0);
+      if (f < 4.0) return mix(c4, c5, f - 3.0);
+      if (f < 5.0) return mix(c5, c6, f - 4.0);
+      return mix(c6, c1, f - 5.0);
+    }
+
+    void main() {
+      vec2 px = 1.0 / uRes;
+      vec4 ink = texture2D(uPrev, vUv);
+
+      // tight bleed (1px)
+      vec4 b = (
+        texture2D(uPrev, vUv + vec2( px.x, 0.0)) +
+        texture2D(uPrev, vUv + vec2(-px.x, 0.0)) +
+        texture2D(uPrev, vUv + vec2(0.0,  px.y)) +
+        texture2D(uPrev, vUv + vec2(0.0, -px.y))
+      ) * 0.25;
+      ink = mix(ink, b, uBleed);
+
+      // wide bleed (2px) - alcohol-marker wicking
+      vec2 q = px * 2.0;
+      vec4 b2 = (
+        texture2D(uPrev, vUv + vec2( q.x, 0.0)) +
+        texture2D(uPrev, vUv + vec2(-q.x, 0.0)) +
+        texture2D(uPrev, vUv + vec2(0.0,  q.y)) +
+        texture2D(uPrev, vUv + vec2(0.0, -q.y))
+      ) * 0.25;
+      ink = mix(ink, b2, uBleed * 0.35);
+
+      // slow dry-out so stains fade instead of saturating the sheet
+      ink.rgb *= uDry;
+
+      float s = min(uRes.x, uRes.y);
+
+      for (int i = 0; i < 6; i++) {
+        float fi = float(i);
+        float speed = 0.10 + 0.10 * hash(fi * 3.17 + 1.0);
+        float ph    = uTime * speed + fi * 13.7;
+        float cyc   = floor(ph);
+        float t     = fract(ph);
+
+        float landY = (0.15 + 0.75 * hash(cyc * 1.7 + fi * 3.3)) * uRes.y;
+        float x     = hash(cyc * 1.31 + fi * 7.7) * uRes.x;
+
+        float fallDur = 0.35;
+        vec2  pos;
+        float radius;
+        float dens;
+
+        if (t < fallDur) {
+          // falling: accelerate like gravity, leave a wet trail
+          float ft = t / fallDur;
+          float y  = mix(-0.06 * uRes.y, landY, ft * ft);
+          pos    = vec2(x + sin(ft * 5.0 + fi * 2.0) * 6.0, y);
+          radius = (0.012 + ft * 0.012) * s;
+          dens   = 0.045;
+        } else {
+          // soaking: hold position, expand, and dry out
+          float st = (t - fallDur) / (1.0 - fallDur);
+          pos    = vec2(x, landY);
+          radius = (0.02 + st * 0.10) * s * (0.7 + 0.6 * hash(cyc * 2.1 + fi));
+          dens   = 0.045 * (1.0 - st);
+        }
+
+        vec2  d  = (vUv * uRes - pos) / radius;
+        float r  = length(d);
+        float blob = 1.0 - smoothstep(0.25, 1.0, r);
+        float ring = smoothstep(0.55, 0.95, r) * (1.0 - smoothstep(0.95, 1.35, r));
+
+        vec3 col    = watercolor(hash(cyc * 5.7 + fi * 13.1));
+        vec3 absorb = (1.0 - col) * dens;
+        ink.rgb += absorb * (blob + ring * 0.6);
+      }
+
+      ink.rgb = clamp(ink.rgb, 0.0, 1.0);
+      gl_FragColor = vec4(ink.rgb, 1.0);
+    }
+  `;
+
+  // Render pass: composite the ink absorption over a procedural paper.
+  const RENDER_FS = `
+    #ifdef GL_FRAGMENT_PRECISION_HIGH
+    precision highp float;
+    #else
+    precision mediump float;
+    #endif
+    varying vec2 vUv;
+    uniform sampler2D uInk;
+    uniform vec2  uRes;
+
+    float hash2(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453123); }
+    float noise(vec2 p) {
+      vec2 i = floor(p), f = fract(p);
+      vec2 u = f * f * (3.0 - 2.0 * f);
+      float a = hash2(i);
+      float b = hash2(i + vec2(1.0, 0.0));
+      float c = hash2(i + vec2(0.0, 1.0));
+      float d = hash2(i + vec2(1.0, 1.0));
+      return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+    }
+    float fbm(vec2 p) {
+      float v = 0.0, a = 0.5;
+      for (int i = 0; i < 4; i++) { v += a * noise(p); p *= 2.03; a *= 0.5; }
+      return v;
+    }
+
+    void main() {
+      float aspect = uRes.x / uRes.y;
+      vec2 uv = vUv;
+
+      float mottle = fbm(uv * vec2(3.0 * aspect, 3.0) + 17.0);
+      float grain  = noise(uv * uRes * 0.35);
+      vec3 paper = mix(vec3(0.965, 0.955, 0.93), vec3(0.895, 0.875, 0.82), mottle * 0.7);
+      paper *= 0.97 + 0.05 * grain;
+
+      vec4 ink = texture2D(uInk, uv);
+      vec3 col = paper * exp(-ink.rgb * 2.2);
+
+      float vig = 1.0 - smoothstep(0.35, 1.25, length((uv - 0.5) * vec2(aspect, 1.0)));
+      col *= mix(0.90, 1.0, vig);
+
+      gl_FragColor = vec4(col, 1.0);
+    }
+  `;
+
+  // ---------------------------------------------------------------- helpers
+  function compile(type, src) {
+    const sh = gl.createShader(type);
+    gl.shaderSource(sh, src);
+    gl.compileShader(sh);
+    if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
+      console.error("shader error:", gl.getShaderInfoLog(sh));
+    }
+    return sh;
+  }
+
+  function makeProgram(vsSrc, fsSrc) {
+    const p = gl.createProgram();
+    gl.attachShader(p, compile(gl.VERTEX_SHADER, vsSrc));
+    gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fsSrc));
+    gl.bindAttribLocation(p, 0, "aPos");
+    gl.linkProgram(p);
+    if (!gl.getProgramParameter(p, gl.LINK_STATUS)) {
+      console.error("link error:", gl.getProgramInfoLog(p));
+    }
+    return p;
+  }
+
+  const simProg    = makeProgram(VS, SIM_FS);
+  const renderProg = makeProgram(VS, RENDER_FS);
+
+  const su = {
+    prev:  gl.getUniformLocation(simProg, "uPrev"),
+    res:   gl.getUniformLocation(simProg, "uRes"),
+    time:  gl.getUniformLocation(simProg, "uTime"),
+    bleed: gl.getUniformLocation(simProg, "uBleed"),
+    dry:   gl.getUniformLocation(simProg, "uDry")
+  };
+  const ru = {
+    ink: gl.getUniformLocation(renderProg, "uInk"),
+    res: gl.getUniformLocation(renderProg, "uRes")
+  };
+
+  // fullscreen quad
+  const quad = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, quad);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
+
+  function drawQuad() {
+    gl.bindBuffer(gl.ARRAY_BUFFER, quad);
+    gl.enableVertexAttribArray(0);
+    gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  }
+
+  // ---------------------------------------------------------------- targets
+  function makeTarget(w, h) {
+    const tex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    const fbo = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    return { tex, fbo, w, h };
+  }
+
+  let read = null, write = null;
+
+  function resize() {
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    canvas.width  = Math.max(1, Math.floor(window.innerWidth * dpr));
+    canvas.height = Math.max(1, Math.floor(window.innerHeight * dpr));
+
+    const scale = 0.5; // simulate at half res, upscale for a softer wash
+    const w = Math.max(1, Math.floor(canvas.width * scale));
+    const h = Math.max(1, Math.floor(canvas.height * scale));
+
+    if (read)  { gl.deleteTexture(read.tex);  gl.deleteFramebuffer(read.fbo); }
+    if (write) { gl.deleteTexture(write.tex); gl.deleteFramebuffer(write.fbo); }
+    read  = makeTarget(w, h);
+    write = makeTarget(w, h);
+  }
+
+  window.addEventListener("resize", resize);
+  resize();
+
+  // ---------------------------------------------------------------- loop
+  function frame(now) {
+    const t = now * 0.001;
+
+    // 1) simulate into `write`, reading from `read`
+    gl.bindFramebuffer(gl.FRAMEBUFFER, write.fbo);
+    gl.viewport(0, 0, write.w, write.h);
+    gl.useProgram(simProg);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, read.tex);
+    gl.uniform1i(su.prev, 0);
+    gl.uniform2f(su.res, write.w, write.h);
+    gl.uniform1f(su.time, t);
+    gl.uniform1f(su.bleed, 0.12);
+    gl.uniform1f(su.dry, 0.996);
+    drawQuad();
+
+    // 2) swap ping/pong
+    const tmp = read; read = write; write = tmp;
+
+    // 3) composite to screen
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.viewport(0, 0, canvas.width, canvas.height);
+    gl.useProgram(renderProg);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, read.tex);
+    gl.uniform1i(ru.ink, 0);
+    gl.uniform2f(ru.res, canvas.width, canvas.height);
+    drawQuad();
+
+    requestAnimationFrame(frame);
+  }
+
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

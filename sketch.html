@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+* { margin: 0; padding: 0; }
+body { overflow: hidden; background: #000; }
+canvas { display: block; width: 100vw; height: 100vh; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+const canvas = document.getElementById('c');
+const gl = canvas.getContext('webgl2');
+let dpr = 1;
+const resize = () => {
+  dpr = Math.min(devicePixelRatio || 1, 2);
+  canvas.width = Math.round(innerWidth * dpr);
+  canvas.height = Math.round(innerHeight * dpr);
+  gl.viewport(0, 0, canvas.width, canvas.height);
+};
+addEventListener('resize', resize); resize();
+
+const vs = `#version 300 es
+in vec2 a_pos;
+void main(){ gl_Position = vec4(a_pos, 0, 1); }`;
+
+const fs = `#version 300 es
+precision highp float;
+uniform vec2 u_res;
+uniform float u_time;
+uniform vec2 u_click;
+uniform float u_click_t;
+out vec4 O;
+
+const int   DROPS   = 8;      // drops alive at once
+const float LIFE    = 18.0;   // seconds from impact to fully faded
+const float STAGGER = 2.25;   // LIFE / DROPS -> one new drop every 2.25s
+
+// ---- SDFs ----
+// signed distance to a ring of radius r, half-thickness w (positive outside the band)
+float sdRing(float d, float r, float w){ return abs(d - r) - w; }
+
+// ---- Noise ----
+float hash(vec2 p){ return fract(sin(dot(p, vec2(127.1,311.7)))*43758.5453); }
+float noise(vec2 p){
+  vec2 i = floor(p), f = fract(p);
+  f = f*f*(3.0-2.0*f);
+  return mix(mix(hash(i), hash(i+vec2(1,0)), f.x),
+             mix(hash(i+vec2(0,1)), hash(i+vec2(1,1)), f.x), f.y);
+}
+float fbm(vec2 p){
+  float v = 0.0, a = 0.5;
+  mat2 rot = mat2(0.8, 0.6, -0.6, 0.8);
+  for(int i = 0; i < 6; i++){ v += a*noise(p); p = rot*p*2.1; a *= 0.5; }
+  return v;
+}
+
+// ---- Paper grain ----
+float paperGrain(vec2 uv){
+  float g = noise(uv*600.0)*0.06;
+  float f = fbm(uv*200.0)*0.04;
+  return g + f;
+}
+
+// ---- Lifetime envelope: rises fast on impact, eases back to exactly 0 at LIFE ----
+float envelope(float age){
+  return smoothstep(0.0, 0.3, age) * (1.0 - smoothstep(LIFE*0.35, LIFE, age));
+}
+
+// ---- One ink drop: bounded coverage in [0,1] ----
+float drop(vec2 p, vec2 origin, float age, float seed){
+  if(age <= 0.0 || age >= LIFE) return 0.0;
+
+  vec2 q = p - origin;
+  float d = length(q);
+  float a = atan(q.y, q.x);
+
+  // organic radial distortion so nothing reads as a perfect circle
+  float wob = 1.0
+    + 0.045*sin(a*5.0  + seed*6.283)
+    + 0.030*sin(a*9.0  - seed*3.141)
+    + 0.018*sin(a*15.0 + 1.7);
+  wob += 0.06*(noise(q*7.0 + seed*23.0) - 0.5);
+  d *= wob;
+
+  // spread decelerates and is bounded, so a drop can never flood the screen
+  float R = 0.30*(1.0 - exp(-age*0.45));
+
+  float ink = 0.0;
+
+  // leading edge: a true annulus, dark only in the band
+  float w = 0.006 + 0.004*exp(-age*0.5);
+  ink += 0.55*(1.0 - smoothstep(-w, 0.0, sdRing(d, R, w)));
+
+  // trailing rings left behind by the advancing front
+  for(int i = 1; i <= 4; i++){
+    float fi = float(i);
+    float sr = R*(1.0 - 0.16*fi);
+    float sw = 0.0035 + 0.0010*sin(sr*40.0 + fi + seed*6.0);
+    ink += (0.26/fi)*(1.0 - smoothstep(-sw, 0.0, sdRing(d, sr, sw)));
+  }
+
+  // faint wash of soaked paper inside the front
+  ink += 0.14*(1.0 - smoothstep(R*0.2, R, d));
+
+  // central pool at the point of impact
+  float pr = 0.012 + 0.030*(1.0 - exp(-age*0.35));
+  ink += 0.85*(1.0 - smoothstep(pr*0.45, pr, d));
+
+  return clamp(ink, 0.0, 1.0) * envelope(age);
+}
+
+// alpha compositing: stays in [0,1] no matter how many drops overlap
+float over(float acc, float add){ return acc + (1.0 - acc)*add; }
+
+// ---- Paper color ----
+vec3 paperColor(vec2 uv){
+  vec3 base = vec3(0.94, 0.91, 0.86);
+  base += paperGrain(uv) * 0.08;
+  float vig = 1.0 - 0.25*length(uv);
+  return base * vig;
+}
+
+// ---- Main ----
+void main(){
+  vec2 uv = gl_FragCoord.xy / u_res;
+  vec2 p = (gl_FragCoord.xy - u_res*0.5) / min(u_res.x, u_res.y);
+  vec2 halfExtent = 0.5*u_res / min(u_res.x, u_res.y);
+
+  vec3 col = paperColor(uv);
+  vec3 ink = vec3(0.05, 0.045, 0.04);
+  float inkAlpha = 0.0;
+
+  float t = u_time;
+
+  // ---- Rolling drops: each slot respawns at a new spot every LIFE seconds ----
+  for(int i = 0; i < DROPS; i++){
+    float fi = float(i);
+    float phase = (t + fi*STAGGER) / LIFE;
+    float gen   = floor(phase);            // which generation of this slot
+    float age   = (phase - gen) * LIFE;
+
+    // jittered 4x2 grid keeps drops spread out; the cell rotates each
+    // generation (3 and 8 are coprime) so no slot camps one corner
+    float cell = mod(fi + gen*3.0, 8.0);
+    vec2 cxy = vec2(mod(cell, 4.0), floor(cell*0.25));
+    vec2 jit = vec2(hash(vec2(fi*7.13 + 0.5, gen*3.77 + 1.3)),
+                    hash(vec2(gen*1.91 + fi*2.7, fi*5.23 + 4.1)));
+    vec2 g01 = (cxy + 0.15 + 0.7*jit) / vec2(4.0, 2.0);
+    vec2 o = (g01*2.0 - 1.0) * halfExtent * 0.85;
+
+    float seed = hash(vec2(gen*13.0 + fi, fi*2.7 + 0.9));
+    inkAlpha = over(inkAlpha, drop(p, o, age, seed));
+  }
+
+  // ---- Click to add drops ----
+  vec2 cp = (u_click - u_res*0.5) / min(u_res.x, u_res.y);
+  inkAlpha = over(inkAlpha, drop(p, cp, t - u_click_t, 0.37));
+
+  // ---- Apply ink ----
+  col = mix(col, ink, inkAlpha);
+
+  // slight warm cast where the ink pools
+  col = mix(col, ink + vec3(0.02, 0.015, 0.01), inkAlpha * 0.3);
+
+  // paper grain still reads through soaked ink
+  col += paperGrain(uv) * inkAlpha * 0.15;
+
+  // carbon black with a touch of warmth
+  col = mix(col, col * vec3(0.95, 0.92, 0.9), smoothstep(0.0, 0.3, inkAlpha) * 0.1);
+
+  col = pow(max(col, 0.0), vec3(0.95));
+  O = vec4(col, 1.0);
+}
+`;
+
+function compile(type, src){
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if(!gl.getShaderParameter(s, gl.COMPILE_STATUS))
+    console.error(gl.getShaderInfoLog(s));
+  return s;
+}
+
+const prog = gl.createProgram();
+gl.attachShader(prog, compile(gl.VERTEX_SHADER, vs));
+gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, fs));
+gl.linkProgram(prog);
+gl.useProgram(prog);
+
+const buf = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1,1,-1,-1,1,1,1]), gl.STATIC_DRAW);
+const aPos = gl.getAttribLocation(prog, 'a_pos');
+gl.enableVertexAttribArray(aPos);
+gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
+
+const uRes = gl.getUniformLocation(prog, 'u_res');
+const uTime = gl.getUniformLocation(prog, 'u_time');
+const uClick = gl.getUniformLocation(prog, 'u_click');
+const uClickT = gl.getUniformLocation(prog, 'u_click_t');
+
+const t0 = performance.now();
+const now = () => (performance.now() - t0)/1000;
+
+let clickT = -999, clickX = 0, clickY = 0;
+canvas.addEventListener('click', e => {
+  clickT = now();
+  clickX = e.clientX * dpr;
+  clickY = (innerHeight - e.clientY) * dpr; // gl_FragCoord.y is bottom-up
+});
+
+(function frame(){
+  gl.uniform2f(uRes, canvas.width, canvas.height);
+  gl.uniform1f(uTime, now());
+  gl.uniform2f(uClick, clickX, clickY);
+  gl.uniform1f(uClickT, clickT);
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
