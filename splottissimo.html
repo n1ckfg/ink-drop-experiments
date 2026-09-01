@@ -67,14 +67,15 @@ const THEME = {
   jitterVal:      0.06
 };
 
-const RING_LIFE = 18.0;   // sketch.html: impact to fully faded
+const RING_LIFE = 9.0;    // seconds from impact to a spent, fully dried wipe
+const RING_FADE_AT = 0.40;// fraction of that life before the wipe starts drying off
 const RING_STAGGER = 2.25;
 const RING_CLICK_GAP = 0.7;  // min seconds between click-spawned rings
 const RING_LIFT  = 1.6;   // how fast the solvent lifts pigment, per second
 const RING_SMEAR = 0.075; // how far the bands are dragged out of true
 const RING_DRAG  = 0.012; // how far lifted pigment is smeared along the wipe
 const RING_CAP = 8;       // live rings; the spare slots let retired ones fade out
-const RING_RETIRE = 1.5;  // seconds a ring takes to fade when its slot is claimed
+const RING_RETIRE = 1.0;  // seconds a ring takes to fade when its slot is claimed
 const STAIN_MIN = 5.5;    // spiffy2.html: seconds between big falling stains
 const STAIN_MAX = 10.0;
 const STAIN_ALIVE = 3;
@@ -83,6 +84,7 @@ const STAIN_ALIVE = 3;
 
 const HEAD = '#version 300 es\nprecision highp float;\n#define MAXD ' + MAXD +
              '\n#define MAXR ' + MAXR + '\n#define RLIFE ' + RING_LIFE.toFixed(1) +
+             '\n#define RFADE ' + RING_FADE_AT.toFixed(3) +
              '\n#define RSMEAR ' + RING_SMEAR.toFixed(4) +
              '\n#define RDRAG ' + RING_DRAG.toFixed(4) + '\n';
 
@@ -269,7 +271,7 @@ float ringLift(vec2 p, vec2 origin, float age, float seed, float tooth){
   lift *= smoothstep(0.10, 0.52, n3 * 0.45 + n5 * 0.35 + n1 * 0.20) * 1.40;
   lift *= 1.15 - 0.45 * tooth;
 
-  float env = smoothstep(0.0, 0.3, age) * (1.0 - smoothstep(RLIFE * 0.35, RLIFE, age));
+  float env = smoothstep(0.0, 0.3, age) * (1.0 - smoothstep(RLIFE * RFADE, RLIFE, age));
   return clamp(lift, 0.0, 1.0) * env;
 }
 
