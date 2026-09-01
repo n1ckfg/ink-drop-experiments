@@ -43,9 +43,39 @@ const AUTO_SPAWN_MIN = 0.35;
 const AUTO_SPAWN_MAX = 1.1;
 const INITIAL_BURST = 12;
 
+// ================================================================ colour theme
+// One hue family for the whole piece.  Each palette keeps its own internal
+// variation -- the relative spacing of its hues, saturations and values is
+// preserved -- but the widest deviation is squeezed down to the spreads below.
+// Set a spread to 0 to collapse that axis to a single value.
+const THEME = {
+  hue:            0.58,   // 0..1 round the wheel: 0 red, .17 yellow, .33 green, .58 blue, .78 violet
+  hueSpread:      0.085,  // half-width of the hue fan the splashes fan out across
+  sat:            0.80,
+  satSpread:      0.13,
+  val:            0.88,
+  valSpread:      0.10,
+
+  stainHueShift: -0.035,  // big washes drift just off the splash hue
+  stainSat:       0.50,
+  stainSatSpread: 0.10,
+  stainVal:       0.68,
+  stainValSpread: 0.09,
+
+  jitterHue:      0.018,  // per-drop wobble, kept inside the family
+  jitterSat:      0.06,
+  jitterVal:      0.06,
+
+  lineHueShift:   0.0,    // concentric ink lines: same family, near-black
+  lineSat:        0.62,
+  lineVal:        0.10,
+  lineWarm:       0.035   // extra value where that ink pools
+};
+
 const RING_LIFE = 18.0;   // sketch.html: impact to fully faded
 const RING_STAGGER = 2.25;
-const RING_CAP = 10;      // live rings; the spare slots let retired ones fade out
+const RING_CLICK_GAP = 0.7;  // min seconds between click-spawned rings
+const RING_CAP = 8;       // live rings; the spare slots let retired ones fade out
 const RING_RETIRE = 1.5;  // seconds a ring takes to fade when its slot is claimed
 const STAIN_MIN = 5.5;    // spiffy2.html: seconds between big falling stains
 const STAIN_MAX = 10.0;
@@ -234,6 +264,8 @@ uniform float uTime;
 uniform vec4 uRing[MAXR];   // xy origin (min-dimension units) | z age | w seed
 uniform vec4 uRingB[MAXR];  // x fade (1 while alive, ramped to 0 when retired)
 uniform int  uRingCount;
+uniform vec3 uInk;          // concentric line ink
+uniform vec3 uInkWarm;      // the same ink where it pools
 
 // ---- concentric ink rings (sketch.html) --------------------------------
 // signed distance to a ring of radius r, half-thickness w (positive outside the band)
@@ -315,10 +347,9 @@ void main(){
     inkA = over(inkA, ringDrop(pr, uRing[i].xy, uRing[i].z, uRing[i].w) * fade);
   }
   if (inkA > 0.0){
-    vec3 ink = vec3(0.05, 0.045, 0.04);
-    col = mix(col, ink, inkA);
-    col = mix(col, ink + vec3(0.02, 0.015, 0.01), inkA * 0.3);   // warm cast where it pools
-    col += (tooth - 0.5) * inkA * 0.10;                          // grain reads through
+    col = mix(col, uInk, inkA);
+    col = mix(col, uInkWarm, inkA * 0.3);   // lifted cast where the ink pools
+    col += (tooth - 0.5) * inkA * 0.10;     // grain reads through
   }
 
   // --- finish ---
@@ -404,6 +435,7 @@ resize();
 
 // ================================================================ droplets
 
+// Source palettes.  These are re-cast through THEME below; edit THEME, not these.
 const PALETTE = [
   [0.93, 0.10, 0.52], // magenta
   [0.86, 0.08, 0.68], // fuchsia
@@ -435,14 +467,88 @@ const STAIN_PALETTE = [
 
 const rnd = (a, b) => a + Math.random() * (b - a);
 const clamp01 = v => v < 0 ? 0 : v > 1 ? 1 : v;
-const pick = () => PALETTE[(Math.random() * PALETTE.length) | 0];
-const pickStain = () => STAIN_PALETTE[(Math.random() * STAIN_PALETTE.length) | 0];
+const TAU = Math.PI * 2;
 
+function rgb2hsv(c){
+  const r = c[0], g = c[1], b = c[2];
+  const mx = Math.max(r, g, b), mn = Math.min(r, g, b), d = mx - mn;
+  let h = 0;
+  if (d > 1e-6){
+    if (mx === r)      h = ((g - b) / d + 6) % 6;
+    else if (mx === g) h = (b - r) / d + 2;
+    else               h = (r - g) / d + 4;
+    h /= 6;
+  }
+  return [h, mx > 1e-6 ? d / mx : 0, mx];
+}
+
+function hsv2rgb(h, s, v){
+  h = ((h % 1) + 1) % 1;
+  s = clamp01(s); v = clamp01(v);
+  const i = Math.floor(h * 6), f = h * 6 - i;
+  const p = v * (1 - s), q = v * (1 - f * s), t = v * (1 - (1 - f) * s);
+  switch (i % 6){
+    case 0:  return [v, t, p];
+    case 1:  return [q, v, p];
+    case 2:  return [p, v, t];
+    case 3:  return [p, q, v];
+    case 4:  return [t, p, v];
+    default: return [v, p, q];
+  }
+}
+
+// Pull a set of values toward `center`, keeping their relative spacing intact
+// but squeezing the widest deviation down to `spread`.
+function tighten(vals, center, spread){
+  let mean = 0;
+  for (let i = 0; i < vals.length; i++) mean += vals[i];
+  mean /= vals.length;
+  let widest = 0;
+  for (let i = 0; i < vals.length; i++) widest = Math.max(widest, Math.abs(vals[i] - mean));
+  const k = widest > 1e-6 ? spread / widest : 0;
+  return vals.map(v => center + (v - mean) * k);
+}
+
+// Re-cast a palette into the theme's hue family.  Hues are handled on the
+// circle, so a palette straddling the red seam still compresses correctly.
+function harmonize(palette, o){
+  const hsv = palette.map(rgb2hsv);
+  let sx = 0, sy = 0;
+  for (let i = 0; i < hsv.length; i++){ sx += Math.cos(hsv[i][0] * TAU); sy += Math.sin(hsv[i][0] * TAU); }
+  const meanH = Math.atan2(sy, sx) / TAU;
+  const dh = hsv.map(c => { const d = c[0] - meanH; return d - Math.round(d); });   // wrap to [-.5,.5]
+
+  const hs = tighten(dh, 0, o.hueSpread);
+  const ss = tighten(hsv.map(c => c[1]), o.sat, o.satSpread);
+  const vs = tighten(hsv.map(c => c[2]), o.val, o.valSpread);
+  return hsv.map((_, i) => hsv2rgb(THEME.hue + o.hueShift + hs[i], ss[i], vs[i]));
+}
+
+const SPLASH_COLS = harmonize(PALETTE, {
+  hueShift: 0, hueSpread: THEME.hueSpread,
+  sat: THEME.sat, satSpread: THEME.satSpread,
+  val: THEME.val, valSpread: THEME.valSpread
+});
+const STAIN_COLS = harmonize(STAIN_PALETTE, {
+  hueShift: THEME.stainHueShift, hueSpread: THEME.hueSpread * 0.8,
+  sat: THEME.stainSat, satSpread: THEME.stainSatSpread,
+  val: THEME.stainVal, valSpread: THEME.stainValSpread
+});
+
+const LINE_INK  = hsv2rgb(THEME.hue + THEME.lineHueShift, THEME.lineSat, THEME.lineVal);
+const LINE_WARM = hsv2rgb(THEME.hue + THEME.lineHueShift, THEME.lineSat * 0.8,
+                          THEME.lineVal + THEME.lineWarm);
+
+const pick = () => SPLASH_COLS[(Math.random() * SPLASH_COLS.length) | 0];
+const pickStain = () => STAIN_COLS[(Math.random() * STAIN_COLS.length) | 0];
+
+// Per-drop wobble now happens in HSV, so a jittered drop stays in the family
+// instead of sliding off-hue the way independent RGB nudges did.
 function inkColor(base){
-  const p = base || pick();
-  return [clamp01(p[0] + rnd(-0.06, 0.06)),
-          clamp01(p[1] + rnd(-0.06, 0.06)),
-          clamp01(p[2] + rnd(-0.06, 0.06))];
+  const c = rgb2hsv(base || pick());
+  return hsv2rgb(c[0] + rnd(-THEME.jitterHue, THEME.jitterHue),
+                 c[1] + rnd(-THEME.jitterSat, THEME.jitterSat),
+                 c[2] + rnd(-THEME.jitterVal, THEME.jitterVal));
 }
 
 const drops = [];
@@ -601,7 +707,7 @@ function updateDrop(d){
 // ================================================================ concentric rings
 
 const rings = [];
-let nextRing = 1.2;
+let nextRing = 1.2, lastRingClick = -99;
 
 // 1 while the ring is alive, easing to 0 across RING_RETIRE once it is retired
 function ringFade(r){
@@ -781,6 +887,8 @@ function frame(now){
   gl.bindTexture(gl.TEXTURE_2D, tex[cur]);
   gl.uniform1i(progMain.loc.uAccum, 0);
   uploadDrops(progMain, pack(wet));
+  gl.uniform3f(progMain.loc.uInk, LINE_INK[0], LINE_INK[1], LINE_INK[2]);
+  gl.uniform3f(progMain.loc.uInkWarm, LINE_WARM[0], LINE_WARM[1], LINE_WARM[2]);
   const nRings = packRings();
   gl.uniform4fv(progMain.loc.uRing, bufR);
   gl.uniform4fv(progMain.loc.uRingB, bufRB);
@@ -800,7 +908,10 @@ canvas.addEventListener('pointerdown', e => {
   const uy = 1.0 - (e.clientY - r.top) / r.height;
   cluster(ux, uy);
   splash(ux, uy);
-  addRing((ux - 0.5) * (W / H), uy - 0.5);
+  if (time - lastRingClick > RING_CLICK_GAP){
+    lastRingClick = time;
+    addRing((ux - 0.5) * (W / H), uy - 0.5);
+  }
   hint.classList.add('gone');
 });
 
