@@ -64,17 +64,15 @@ const THEME = {
 
   jitterHue:      0.018,  // per-drop wobble, kept inside the family
   jitterSat:      0.06,
-  jitterVal:      0.06,
-
-  lineHueShift:   0.0,    // concentric ink lines: same family, near-black
-  lineSat:        0.62,
-  lineVal:        0.10,
-  lineWarm:       0.035   // extra value where that ink pools
+  jitterVal:      0.06
 };
 
 const RING_LIFE = 18.0;   // sketch.html: impact to fully faded
 const RING_STAGGER = 2.25;
 const RING_CLICK_GAP = 0.7;  // min seconds between click-spawned rings
+const RING_LIFT  = 2.6;   // how fast the solvent lifts pigment, per second
+const RING_SMEAR = 0.048; // how far the bands are dragged out of true
+const RING_DRAG  = 0.012; // how far lifted pigment is smeared along the wipe
 const RING_CAP = 8;       // live rings; the spare slots let retired ones fade out
 const RING_RETIRE = 1.5;  // seconds a ring takes to fade when its slot is claimed
 const STAIN_MIN = 5.5;    // spiffy2.html: seconds between big falling stains
@@ -84,7 +82,9 @@ const STAIN_ALIVE = 3;
 // ================================================================ shaders
 
 const HEAD = '#version 300 es\nprecision highp float;\n#define MAXD ' + MAXD +
-             '\n#define MAXR ' + MAXR + '\n#define RLIFE ' + RING_LIFE.toFixed(1) + '\n';
+             '\n#define MAXR ' + MAXR + '\n#define RLIFE ' + RING_LIFE.toFixed(1) +
+             '\n#define RSMEAR ' + RING_SMEAR.toFixed(4) +
+             '\n#define RDRAG ' + RING_DRAG.toFixed(4) + '\n';
 
 const COMMON = `
 uniform vec2 uRes;
@@ -92,6 +92,9 @@ uniform vec4 uA[MAXD];   // xy center (uv) | z radius (y-units) | w seed
 uniform vec4 uB[MAXD];   // x strength | y fragmentation | z squash | w tendril amount
 uniform vec4 uC[MAXD];   // rgb ink transmission colour | a softness (big stain)
 uniform int  uCount;
+uniform vec4 uRing[MAXR];   // xy origin (min-dimension units) | z age | w seed
+uniform vec4 uRingB[MAXR];  // x fade (1 while alive, ramped to 0 when retired)
+uniform int  uRingCount;
 
 float hash21(vec2 p){
   p = fract(p * vec2(123.34, 456.21));
@@ -194,6 +197,73 @@ float dropDensity(vec2 p, float R, float seed, float squash, float tendril,
   return dens * (0.82 + 0.36 * tooth);                        // granulation
 }
 
+// signed distance to a ring of radius r, half-thickness w (positive outside the band)
+float sdRing(float d, float r, float w){ return abs(d - r) - w; }
+
+// alpha compositing: stays in [0,1] no matter how many rings overlap
+float over(float acc, float add){ return acc + (1.0 - acc) * add; }
+
+// A wet blotter dropped on the sheet: concentric bands of solvent that wick
+// outward and lift pigment instead of laying any down.  Nothing is drawn, so
+// this returns pure coverage -- and it is deliberately ragged: the sample point
+// is dragged around by noise so the bands smear, tear and wander rather than
+// reading as the clean annuli they came from.
+float ringLift(vec2 p, vec2 origin, float age, float seed, float tooth){
+  if (age <= 0.0 || age >= RLIFE) return 0.0;
+
+  vec2 q = p - origin;
+  float d0 = length(q);
+
+  // spread decelerates and is bounded, so a wipe can never flood the screen
+  float R = 0.30 * (1.0 - exp(-age * 0.45));
+  if (d0 > R * 1.15 + RSMEAR * 2.5) return 0.0;   // reject before paying for noise
+
+  // five taps, reused for both the smear and the patchiness -- fbm here would
+  // cost 4x this and the bands are too ragged to show the difference
+  float n1 = vnoise(q * 7.0  + seed * 19.0);
+  float n2 = vnoise(q * 7.0  + seed * 41.0);
+  float n3 = vnoise(q * 23.0 + seed * 7.3);
+  float n4 = vnoise(q * 23.0 + seed * 3.9);
+  float n5 = vnoise(q * 47.0 + seed * 5.1);
+
+  float a = atan(q.y, q.x);
+  float wob = 1.0 + 0.06 * sin(a * 5.0 + seed * 6.283)
+                  + 0.04 * sin(a * 9.0 - seed * 3.141);
+
+  // the smear: drag the sample far enough that the bands tear open
+  vec2 warp = (vec2(n1, n2) - 0.5) * RSMEAR + (vec2(n3, n4) - 0.5) * (RSMEAR * 0.40);
+  float d = length(q + warp) * wob;
+
+  float lift = 0.0;
+
+  // the wet front: a rag's width rather than a pen line
+  float w = 0.020 + 0.016 * exp(-age * 0.4);
+  lift += 0.95 * (1.0 - smoothstep(-w, w * 0.6, sdRing(d, R, w)));
+
+  // bands the advancing front left behind
+  for (int i = 1; i <= 4; i++){
+    float fi = float(i);
+    float sr = R * (1.0 - 0.16 * fi);
+    float sw = 0.010 + 0.004 * sin(sr * 40.0 + fi + seed * 6.0);
+    lift += (0.42 / fi) * (1.0 - smoothstep(-sw, sw * 0.7, sdRing(d, sr, sw)));
+  }
+
+  // the soaked interior comes up too, but only partly
+  lift += 0.26 * (1.0 - smoothstep(R * 0.15, R, d));
+
+  // and the pool at the point of impact comes up clean
+  float pool = 0.014 + 0.034 * (1.0 - exp(-age * 0.35));
+  lift += 0.90 * (1.0 - smoothstep(pool * 0.45, pool, d));
+
+  // messy coverage: some patches lift clean, others hardly take at all, and
+  // pigment held down in the tooth of the paper resists the rag
+  lift *= 0.30 + 1.30 * (n3 * 0.45 + n5 * 0.35 + n1 * 0.20);
+  lift *= 1.15 - 0.45 * tooth;
+
+  float env = smoothstep(0.0, 0.3, age) * (1.0 - smoothstep(RLIFE * 0.35, RLIFE, age));
+  return clamp(lift, 0.0, 1.0) * env;
+}
+
 // Beer-Lambert: ink transmitting colour col absorbs (1 - col)
 vec3 pigment(float dens, vec3 col){
   return exp(-dens * (1.0 - col) * 2.35);
@@ -246,14 +316,46 @@ void main(){
 }
 `;
 
-// evaporation: every stain walks back toward paper white at a fixed rate, clamped at 1
-const FRAG_FADE = HEAD + `
+// Evaporation, plus the solvent wipe.  Both walk the sheet back toward paper
+// white, so they share a pass -- and the wipe's coverage is parked in the
+// accumulation buffer's alpha, which nothing else uses, so the composite can
+// read it back with one texture fetch instead of re-running the ring loop.
+const FRAG_LIFT = HEAD + COMMON + `
 out vec4 fragColor;
 uniform sampler2D uSrc;
-uniform vec2 uRes;
-uniform float uAmt;
+uniform float uAmt;    // evaporation this step
+uniform float uLift;   // solvent strength this step (per-second rate * dt)
 void main(){
-  fragColor = vec4(min(texture(uSrc, gl_FragCoord.xy / uRes).rgb + uAmt, vec3(1.0)), 1.0);
+  vec2 uv = gl_FragCoord.xy / uRes;
+  float asp = uRes.x / uRes.y;
+  vec2 pr = (uv - 0.5) * vec2(asp, 1.0);   // min-dimension units, y up
+  float tooth = paperTooth(uv, asp);
+
+  float lift = 0.0, strongest = 0.0;
+  vec2 dir = vec2(0.0);
+  for (int i = 0; i < MAXR; i++){
+    if (i >= uRingCount) break;
+    float f = uRingB[i].x;
+    if (f <= 0.0) continue;
+    float c = ringLift(pr, uRing[i].xy, uRing[i].z, uRing[i].w, tooth) * f;
+    if (c > strongest){                     // smear along whichever wipe dominates here
+      strongest = c;
+      vec2 v = pr - uRing[i].xy;
+      dir = v / max(length(v), 1e-4);
+    }
+    lift = over(lift, c);
+  }
+
+  vec3 src = texture(uSrc, uv).rgb;
+
+  if (lift > 0.0){
+    // a rag drags pigment as well as removing it
+    vec2 off = (dir * RDRAG * lift) / vec2(asp, 1.0);
+    src = mix(src, texture(uSrc, uv - off).rgb, 0.55 * lift);
+    src = mix(src, vec3(1.0), clamp(lift * uLift, 0.0, 1.0));
+  }
+
+  fragColor = vec4(min(src + uAmt, vec3(1.0)), lift);
 }
 `;
 
@@ -261,96 +363,30 @@ const FRAG_MAIN = HEAD + COMMON + `
 out vec4 fragColor;
 uniform sampler2D uAccum;
 uniform float uTime;
-uniform vec4 uRing[MAXR];   // xy origin (min-dimension units) | z age | w seed
-uniform vec4 uRingB[MAXR];  // x fade (1 while alive, ramped to 0 when retired)
-uniform int  uRingCount;
-uniform vec3 uInk;          // concentric line ink
-uniform vec3 uInkWarm;      // the same ink where it pools
-
-// ---- concentric ink rings (sketch.html) --------------------------------
-// signed distance to a ring of radius r, half-thickness w (positive outside the band)
-float sdRing(float d, float r, float w){ return abs(d - r) - w; }
-
-float ringDrop(vec2 p, vec2 origin, float age, float seed){
-  if (age <= 0.0 || age >= RLIFE) return 0.0;
-
-  vec2 q = p - origin;
-  float d0 = length(q);
-
-  // spread decelerates and is bounded, so a drop can never flood the screen
-  float R = 0.30 * (1.0 - exp(-age * 0.45));
-  if (d0 > R * 1.4 + 0.03) return 0.0;   // reject before paying for atan/noise
-
-  float a = atan(q.y, q.x);
-
-  // organic radial distortion so nothing reads as a perfect circle
-  float wob = 1.0
-    + 0.045 * sin(a * 5.0  + seed * 6.283)
-    + 0.030 * sin(a * 9.0  - seed * 3.141)
-    + 0.018 * sin(a * 15.0 + 1.7);
-  wob += 0.06 * (vnoise(q * 7.0 + seed * 23.0) - 0.5);
-  float d = d0 * wob;
-
-  float ink = 0.0;
-
-  // leading edge: a true annulus, dark only in the band
-  float w = 0.006 + 0.004 * exp(-age * 0.5);
-  ink += 0.55 * (1.0 - smoothstep(-w, 0.0, sdRing(d, R, w)));
-
-  // trailing rings left behind by the advancing front
-  for (int i = 1; i <= 4; i++){
-    float fi = float(i);
-    float sr = R * (1.0 - 0.16 * fi);
-    float sw = 0.0035 + 0.0010 * sin(sr * 40.0 + fi + seed * 6.0);
-    ink += (0.26 / fi) * (1.0 - smoothstep(-sw, 0.0, sdRing(d, sr, sw)));
-  }
-
-  // faint wash of soaked paper inside the front, kept light so the colour reads through
-  ink += 0.09 * (1.0 - smoothstep(R * 0.2, R, d));
-
-  // central pool at the point of impact
-  float pr = 0.012 + 0.030 * (1.0 - exp(-age * 0.35));
-  ink += 0.62 * (1.0 - smoothstep(pr * 0.45, pr, d));
-
-  float env = smoothstep(0.0, 0.3, age) * (1.0 - smoothstep(RLIFE * 0.35, RLIFE, age));
-  return clamp(ink, 0.0, 1.0) * env;
-}
-
-// alpha compositing: stays in [0,1] no matter how many rings overlap
-float over(float acc, float add){ return acc + (1.0 - acc) * add; }
 
 void main(){
   vec2 uv = gl_FragCoord.xy / uRes;
   float asp = uRes.x / uRes.y;
   float tooth = paperTooth(uv, asp);
 
-  // --- cold-press paper ---
+  // --- cold-press paper, already wiped by the lift pass ---
   vec3 col = paperColor(uv, asp) * sampleStain(uv, uAccum, uRes);
 
+  // solvent coverage the lift pass parked in alpha; the baked layer has already
+  // had it applied, so it is only owed to drops that have yet to settle
+  float lift = texture(uAccum, uv).a;
+
   // --- drops still wet on the surface ---
+  vec3 T = vec3(1.0);
   for (int i = 0; i < MAXD; i++){
     if (i >= uCount) break;
     vec2 p = vec2((uv.x - uA[i].x) * asp, uv.y - uA[i].y);
     float dens = dropDensity(p, uA[i].z, uA[i].w, uB[i].z, uB[i].w,
                              uB[i].y, uC[i].a, tooth) * uB[i].x;
     if (dens <= 0.0) continue;
-    col *= pigment(dens, uC[i].rgb);
+    T *= pigment(dens, uC[i].rgb);
   }
-
-  // --- black concentric lines, laid over the wash ---
-  vec2 pr = (uv - 0.5) * vec2(asp, 1.0);   // min-dimension units, y up
-  float inkA = 0.0;
-  for (int i = 0; i < MAXR; i++){
-    if (i >= uRingCount) break;
-    float fade = uRingB[i].x;
-    if (fade <= 0.0) continue;
-    inkA = over(inkA, ringDrop(pr, uRing[i].xy, uRing[i].z, uRing[i].w) * fade);
-  }
-  if (inkA > 0.0){
-    col = mix(col, uInk, inkA);
-    col = mix(col, uInkWarm, inkA * 0.3);   // lifted cast where the ink pools
-    col += (tooth - 0.5) * inkA * 0.10;     // grain reads through
-  }
+  col *= mix(T, vec3(1.0), lift);   // the wipe thins them before they ever settle
 
   // --- finish ---
   // vignette
@@ -389,7 +425,7 @@ function program(fragSrc){
 
 const progMain = program(FRAG_MAIN);
 const progBake = program(FRAG_BAKE);
-const progFade = program(FRAG_FADE);
+const progLift = program(FRAG_LIFT);
 
 gl.bindVertexArray(gl.createVertexArray());
 
@@ -400,7 +436,7 @@ let cur = 0, W = 0, H = 0;
 
 function clearPaper(){
   gl.disable(gl.BLEND);
-  gl.clearColor(1, 1, 1, 1);
+  gl.clearColor(1, 1, 1, 0);
   for (let i = 0; i < 2; i++){
     gl.bindFramebuffer(gl.FRAMEBUFFER, fb[i]);
     gl.clear(gl.COLOR_BUFFER_BIT);
@@ -534,10 +570,6 @@ const STAIN_COLS = harmonize(STAIN_PALETTE, {
   sat: THEME.stainSat, satSpread: THEME.stainSatSpread,
   val: THEME.stainVal, valSpread: THEME.stainValSpread
 });
-
-const LINE_INK  = hsv2rgb(THEME.hue + THEME.lineHueShift, THEME.lineSat, THEME.lineVal);
-const LINE_WARM = hsv2rgb(THEME.hue + THEME.lineHueShift, THEME.lineSat * 0.8,
-                          THEME.lineVal + THEME.lineWarm);
 
 const pick = () => SPLASH_COLS[(Math.random() * SPLASH_COLS.length) | 0];
 const pickStain = () => STAIN_COLS[(Math.random() * STAIN_COLS.length) | 0];
@@ -772,6 +804,12 @@ function packRings(){
   return n;
 }
 
+function uploadRings(pr, n){
+  gl.uniform4fv(pr.loc.uRing, bufR);
+  gl.uniform4fv(pr.loc.uRingB, bufRB);
+  gl.uniform1i(pr.loc.uRingCount, n);
+}
+
 function uploadDrops(pr, n){
   gl.uniform4fv(pr.loc.uA, bufA);
   gl.uniform4fv(pr.loc.uB, bufB);
@@ -781,6 +819,7 @@ function uploadDrops(pr, n){
 
 let last = performance.now() / 1000;
 let pendingFade = 0;
+let liftActive = false;   // forces one last pass to clear alpha after the final ring dies
 
 function frame(now){
   now /= 1000;
@@ -846,22 +885,30 @@ function frame(now){
   gl.disable(gl.DEPTH_TEST);
   gl.viewport(0, 0, W, H);
 
-  // evaporation: a fully saturated channel reaches paper white in FADE_TIME seconds
+  // evaporation + the solvent wipe.  Evaporation alone can wait for a step big
+  // enough to survive 8-bit quantisation, but an active wipe needs the pass
+  // every frame, so it runs on either trigger and only banks the fade when the
+  // step was actually large enough to apply.
   if (!paused) {
     pendingFade += dt / FADE_TIME;
-    if (pendingFade > (hasFloat ? 0.0 : 0.006)){
+    const ringsNow = rings.length > 0;
+    const fadeReady = pendingFade > (hasFloat ? 0.0 : 0.006);
+    if (fadeReady || ringsNow || liftActive){
       gl.bindFramebuffer(gl.FRAMEBUFFER, fb[cur ^ 1]);
       gl.disable(gl.BLEND);
-      gl.useProgram(progFade.p);
-      gl.uniform2f(progFade.loc.uRes, W, H);
-      gl.uniform1f(progFade.loc.uAmt, pendingFade);
+      gl.useProgram(progLift.p);
+      gl.uniform2f(progLift.loc.uRes, W, H);
+      gl.uniform1f(progLift.loc.uAmt, fadeReady ? pendingFade : 0.0);
+      gl.uniform1f(progLift.loc.uLift, RING_LIFT * dt);
+      uploadRings(progLift, packRings());
       gl.activeTexture(gl.TEXTURE0);
       gl.bindTexture(gl.TEXTURE_2D, tex[cur]);
-      gl.uniform1i(progFade.loc.uSrc, 0);
+      gl.uniform1i(progLift.loc.uSrc, 0);
       gl.drawArrays(gl.TRIANGLES, 0, 3);
       cur ^= 1;
-      pendingFade = 0;
+      if (fadeReady) pendingFade = 0;
     }
+    liftActive = ringsNow;
   }
 
   // stamp settled drops: dst *= transmittance
@@ -887,12 +934,6 @@ function frame(now){
   gl.bindTexture(gl.TEXTURE_2D, tex[cur]);
   gl.uniform1i(progMain.loc.uAccum, 0);
   uploadDrops(progMain, pack(wet));
-  gl.uniform3f(progMain.loc.uInk, LINE_INK[0], LINE_INK[1], LINE_INK[2]);
-  gl.uniform3f(progMain.loc.uInkWarm, LINE_WARM[0], LINE_WARM[1], LINE_WARM[2]);
-  const nRings = packRings();
-  gl.uniform4fv(progMain.loc.uRing, bufR);
-  gl.uniform4fv(progMain.loc.uRingB, bufRB);
-  gl.uniform1i(progMain.loc.uRingCount, nRings);
   gl.drawArrays(gl.TRIANGLES, 0, 3);
 
   requestAnimationFrame(frame);
